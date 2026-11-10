@@ -1,0 +1,24 @@
+# Entorno virtual y dependencias
+.venv/
+env/
+venv/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Datos pesados y binarios (Zenodo 258MB, npy 337MB superan limite de 100MB de GitHub)
+data/raw/*.zip
+data/*.npy
+data/raw/
+*.pt
+*.pth
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
