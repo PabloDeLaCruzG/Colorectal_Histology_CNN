@@ -37,9 +37,9 @@ La presente memoria documenta el diseño, implementación, experimentación y an
 
 ### 2.1 Formulación del problema
 El objetivo médico es asistir al patólogo en la identificación automatizada de tejido tumoral a partir de biopsias digitalizadas de colon. Matemáticamente, se formula como un problema de **clasificación binaria supervisada**:
-Dado un tensor de imagen de entrada $X \in \mathbb{R}^{3 \times H \times W}$, el modelo debe estimar la probabilidad posterior $P(Y = 1 \mid X)$, donde:
-* $Y = 1$: Tejido patológico (**TUMOR**, clase positiva de interés clínico).
-* $Y = 0$: Tejido no tumoral (**NO TUMOR**, clase negativa compuesta por 7 tipos de tejido estromal y epitelial sano).
+Dado un tensor de imagen de entrada X de dimensiones 3 × H × W, el modelo debe estimar la probabilidad posterior P(Y = 1 | X), donde:
+* Y = 1: Tejido patológico (**TUMOR**, clase positiva de interés clínico).
+* Y = 0: Tejido no tumoral (**NO TUMOR**, clase negativa compuesta por 7 tipos de tejido estromal y epitelial sano).
 
 ### 2.2 Framework y confirmación de uso de PyTorch
 El enunciado oficial sugiere TensorFlow/Keras pero autoriza explícitamente PyTorch si se cuenta con experiencia o preferencia técnica. Asimismo, en clase presencial el profesor reiteró verbalmente dicha libertad. Se adopta **PyTorch (v2.14.0)** debido a:
@@ -52,9 +52,9 @@ El conjunto de datos procede del repositorio oficial de **Zenodo (record 53169, 
 
 * **El desafío del hardware:** El entorno de desarrollo es un MacBook Pro M2 con 8 GB de memoria RAM unificada (compartida entre CPU, GPU del chip y el sistema operativo).
 * **Decisión de empaquetado en uint8:** 
-  * Un tensor global en `float32` de $5.000 \times 150 \times 150 \times 3 \times 4 \text{ bytes}$ ocuparía **1,35 GB** en memoria bruta. Al sumarle los tensores de gradientes, mapas de características activados y buffers del sistema, el consumo superaría los 3–4 GB, provocando paginación a disco (*swap memory*) y ralentizando drásticamente la ejecución.
-  * Al empaquetar el dataset en disco y memoria en enteros sin signo de 8 bits (`uint8`, $[0, 255]$), el archivo `images_150x150.npy` ocupa únicamente **321,87 MB** (exactamente 4 veces menos).
-  * La conversión a tensores `float32` normalizados en el rango $[0.0, 1.0]$ se realiza **estrictamente sobre la marcha por lote** en el `DataLoader`. Con un tamaño de lote de 32 imágenes, solo residen en la GPU **~8,6 MB** en cada iteración.
+  * Un tensor global en `float32` de 5.000 × 150 × 150 × 3 × 4 bytes ocuparía **1,35 GB** en memoria bruta. Al sumarle los tensores de gradientes, mapas de características activados y buffers del sistema, el consumo superaría los 3–4 GB, provocando paginación a disco (*swap memory*) y ralentizando drásticamente la ejecución.
+  * Al empaquetar el dataset en disco y memoria en enteros sin signo de 8 bits (`uint8`, [0, 255]), el archivo `images_150x150.npy` ocupa únicamente **321,87 MB** (exactamente 4 veces menos).
+  * La conversión a tensores `float32` normalizados en el rango [0.0, 1.0] se realiza **estrictamente sobre la marcha por lote** en el `DataLoader`. Con un tamaño de lote de 32 imágenes, solo residen en la GPU **~8,6 MB** en cada iteración.
 
 ### 2.4 Análisis del desbalance de clases (1:7)
 El dataset presenta un marcado desequilibrio de clases derivado de la binarización de 8 categorías equitativas (625 teselas por categoría):
@@ -82,10 +82,10 @@ Para garantizar estimaciones insesgadas, se aplica una validación cruzada estra
 3. **Aislamiento en cada iteración:** Se utiliza el patrón de diseño de fábrica (`model_factory`), instanciando un modelo completamente nuevo con pesos reinicializados en cada pliegue.
 
 ### 3.3 Protocolo estadístico y cálculo de ROC-AUC
-* **Probabilidad continua:** Se extraen las probabilidades continuas de la clase positiva tras la función softmax ($P(Y=1 \mid X)$). Se prohíbe el uso de `np.round`, que genera empates artificiales.
-* **Test de rangos con signo de Wilcoxon:** Para comparar dos modelos $A$ y $B$, se contrasta la diferencia pareada de sus 10 valores de ROC-AUC pliegue a pliegue ($N=10$). El p-valor mínimo medible a dos colas es:
-  $$p_{\min} = \frac{2}{2^{10}} = \frac{2}{1024} \approx 0,001953$$
-* **Corrección de Holm-Bonferroni:** En comparaciones múltiples, se aplica el procedimiento step-down de Holm para acotar la tasa de error por familia (FWER) al nivel de significación $\alpha = 0,05$.
+* **Probabilidad continua:** Se extraen las probabilidades continuas de la clase positiva tras la función softmax (P(Y = 1 | X)). Se prohíbe el uso de `np.round`, que genera empates artificiales.
+* **Test de rangos con signo de Wilcoxon:** Para comparar dos modelos A y B, se contrasta la diferencia pareada de sus 10 valores de ROC-AUC pliegue a pliegue (N = 10). El p-valor mínimo medible a dos colas es:
+  p_min = 2 / 2^10 = 2 / 1024 ≈ 0,001953
+* **Corrección de Holm-Bonferroni:** En comparaciones múltiples, se aplica el procedimiento step-down de Holm para acotar la tasa de error por familia (FWER) al nivel de significación α = 0,05.
 
 ---
 
@@ -106,7 +106,7 @@ Como punto de partida estipulado por el profesor en `Colorectal_histology_LeNet5
 * **Optimizador:** Descenso por Gradiente Estocástico (`SGD`) con tasa de aprendizaje fija $lr = 0,01$, sin momentum ni decaimiento de pesos.
 * **Épocas:** 25 épocas por pliegue.
 * **Tamaño de lote (*batch size*):** 32 muestras.
-* **Pérdida:** `nn.CrossEntropyLoss(weight=weight_tensor)` donde los pesos de clase se calculan como $w_c = \frac{N}{C \cdot N_c}$, resultando en pesos aproximados de $w_0 \approx 0,57$ y $w_1 \approx 4,00$ (relación 1:7).
+* **Pérdida:** `nn.CrossEntropyLoss(weight=weight_tensor)` donde los pesos de clase se calculan como w_c = N / (C · N_c), resultando en pesos aproximados de w_0 ≈ 0,57 y w_1 ≈ 4,00 (relación 1:7).
 
 ### 4.3 Auditoría crítica del notebook del profesor
 Durante la fase de análisis del notebook de referencia en tf.keras, se descubrieron dos anomalías técnicas de gran impacto que fueron corregidas en nuestra implementación en PyTorch:
@@ -115,7 +115,7 @@ Durante la fase de análisis del notebook de referencia en tf.keras, se descubri
    `metrics.roc_auc_score(y_test, np.round(y_scores[:, 1], 2))`
    Al redondear a 2 decimales, cuando una red tiene salidas poco dispersas (como ocurre con las sigmoides), todas las probabilidades colapsan en el mismo valor discreto (`0.45`). La función de scikit-learn trata todas las muestras como empates, provocando que el ROC-AUC se desplome artificialmente a **0,5000** (equivalente a tirar una moneda al aire). En PyTorch, se evalúan las probabilidades continuas reales extraídas con softmax de 32 bits.
 2. **Definición de etiquetas:**
-   El notebook invertía el sentido habitual asignando `y[y > 0] = 1`, tratando la clase mayoritaria (sana) como positiva. En esta memoria y en el código de entrega, la clase positiva $1$ es estrictamente **TUMOR**, respetando la convención médica y la interpretación diagnóstica estándar.
+   El notebook invertía el sentido habitual asignando `y[y > 0] = 1`, tratando la clase mayoritaria (sana) como positiva. En esta memoria y en el código de entrega, la clase positiva 1 es estrictamente **TUMOR**, respetando la convención médica y la interpretación diagnóstica estándar.
 
 ### 4.4 Resultados experimentales del Baseline (10-CV)
 La ejecución completa de los 10 pliegues del Baseline en Apple Silicon (MPS) completó en **178,71 segundos** (~17,8 s/pliegue):
@@ -132,7 +132,7 @@ La ejecución completa de los 10 pliegues del Baseline en Apple Silicon (MPS) co
 | Fold 7 | 4.500 | 500 | 0,8163 | 0,8760 | 0,0000 |
 | Fold 8 | 4.500 | 500 | 0,7963 | 0,8760 | 0,0000 |
 | Fold 9 | 4.500 | 500 | 0,7540 | 0,8760 | 0,0000 |
-| **Media $\pm$ Std** | — | — | **0,8218 $\pm$ 0,0291** | **0,8750 $\pm$ 0,0011** | **0,0000 $\pm$ 0,0000** |
+| **Media ± Std** | — | — | **0,8218 ± 0,0291** | **0,8750 ± 0,0011** | **0,0000 ± 0,0000** |
 
 * **Matriz de confusión global agregada (5.000 instancias OOF):**
   * NO TUMOR predicho: 5.000 (4.375 verdaderos negativos, 625 falsos negativos).
@@ -140,12 +140,12 @@ La ejecución completa de los 10 pliegues del Baseline en Apple Silicon (MPS) co
 
 ### 4.5 Diagnóstico técnico: ¿Por qué F1 es 0 y ROC-AUC es 0,8218?
 El análisis cuantitativo de las probabilidades predichas `y_prob` sobre las 5.000 muestras OOF arrojó la siguiente distribución:
-* Valor mínimo: $0,4542$ | Valor máximo: $0,4548$.
-* Rango dinámico: apenas **$0,00067$**.
-* Media en TUMOR real: **$0,45460$** | Media en NO TUMOR real: **$0,45454$**.
+* Valor mínimo: 0,4542 | Valor máximo: 0,4548.
+* Rango dinámico: apenas **0,00067**.
+* Media en TUMOR real: **0,45460** | Media en NO TUMOR real: **0,45454**.
 
 **Explicación matemática del fenómeno:**
-La combinación de activaciones Sigmoid y optimizador SGD básico provoca un severo **desvanecimiento del gradiente**. La derivada de la sigmoide $\sigma'(z) \le 0,25$ reduce exponencialmente el gradiente que retropropaga hacia las primeras capas ($\approx 0,25^4 \approx 0,0039$). Como consecuencia, los pesos no logran escalar los logits de salida lo suficiente como para vencer el umbral estándar de decisión $\tau = 0,5$. Todas las predicciones discretas se asignan a la clase 0, provocando un $F1 = 0$.
+La combinación de activaciones Sigmoid y optimizador SGD básico provoca un severo **desvanecimiento del gradiente**. La derivada de la sigmoide σ'(z) ≤ 0,25 reduce exponencialmente el gradiente que retropropaga hacia las primeras capas (≈ 0,25⁴ ≈ 0,0039). Como consecuencia, los pesos no logran escalar los logits de salida lo suficiente como para vencer el umbral estándar de decisión τ = 0,5. Todas las predicciones discretas se asignan a la clase 0, provocando un F1 = 0.
 
 Sin embargo, el gradiente sí fue suficiente para orientar los pesos en la dirección correcta: las muestras tumorales reciben sistemáticamente probabilidades mayores que las sanas. Debido a que el **ROC-AUC mide la concordancia de rangos (estadístico U de Mann-Whitney)** a lo largo de todos los umbrales posibles, la red alcanza un meritorio **0,8218**, demostrando que extrae patrones discriminativos pero carece de calibración en la capa de salida.
 
@@ -157,7 +157,7 @@ Sin embargo, el gradiente sí fue suficiente para orientar los pesos en la direc
 
 *(Secciones a completar sistemáticamente en los próximos experimentos)*
 
-* **5.1 Experimento 1 (Arquitectura y activaciones):** LeNet-5 con activaciones ReLU ($f(x) = \max(0, x)$) para mitigar el desvanecimiento del gradiente.
+* **5.1 Experimento 1 (Arquitectura y activaciones):** LeNet-5 con activaciones ReLU (f(x) = max(0, x)) para mitigar el desvanecimiento del gradiente.
 * **5.2 Experimento 2 (Optimizadores):** Comparación sistemática de SGD vs. Adam y AdamW (momentos de primer y segundo orden y desacoplamiento de decaimiento de pesos).
 * **5.3 Experimento 3 (Resolución de entrada y CNN moderna):** Escalado de 32×32 a resolución nativa 150×150 con incorporación de Batch Normalization y Dropout.
 * **5.4 Experimento 4 (Aumento de datos con fundamentación biológica):** Invarianza rotacional y reflexiva en biopsias microscópicas (`RandomHorizontalFlip`, `RandomVerticalFlip`, rotaciones ortogonales de 90°).
