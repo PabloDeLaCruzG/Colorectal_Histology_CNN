@@ -1,0 +1,2 @@
+model,roc_auc_mean,roc_auc_std,acc_mean,acc_std,f1_mean,f1_std
+baseline_lenet5,0.8218,0.0291,0.875,0.0011,0.0,0.0

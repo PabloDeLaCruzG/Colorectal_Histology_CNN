@@ -65,10 +65,11 @@ def download_dataset() -> None:
         print(f"MD5 erroneo ({file_md5} != {EXPECTED_MD5}). Re-descargando...")
 
     print(f"Descargando dataset desde {ZENODO_URL}...")
-    headers = {"User-Agent": "Mozilla/5.0"}
-    req = urllib.request.Request(ZENODO_URL, headers=headers)
-    with urllib.request.urlopen(req) as response, open(ZIP_PATH, "wb") as out_file:
-        shutil.copyfileobj(response, out_file)
+    import subprocess
+    cmd = ["curl", "-L", "--fail", "-o", str(ZIP_PATH), ZENODO_URL]
+    res = subprocess.run(cmd, capture_output=False)
+    if res.returncode != 0:
+        raise RuntimeError(f"Fallo al descargar con curl (codigo {res.returncode})")
 
     print("Descarga completada. Verificando integridad...")
     file_md5 = compute_md5(ZIP_PATH)
