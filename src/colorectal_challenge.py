@@ -15,7 +15,7 @@ Contenido del Nivel Basico:
 """
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Type
 import json
 import time
 
@@ -213,36 +213,75 @@ class LeNet5ReLU(nn.Module):
         return x
 
 
-# Envoltorio de entrenamiento y prediccion para LeNet-5 ReLU
-class LeNet5ReLUClassifier:
+# ---------------------------------------------------------------------------
+# 3. ENVOLTORIO UNIFICADO Y CONFIGURABLE (Patron Estrategia)
+# ---------------------------------------------------------------------------
+class HistologyClassifier:
+    """
+    Envoltorio unificado para entrenamiento e inferencia de CNNs histologicas.
+    
+    Aplica el patron Estrategia para evitar duplicar codigo entre experimentos:
+    permite desacoplar la arquitectura (LeNet-5 Sigmoid, LeNet-5 ReLU, etc.)
+    del optimizador (SGD, Adam, AdamW), garantizando que todos los modelos se
+    evaluan bajo exactamente el mismo protocolo de cero fuga y gestion de memoria.
+    """
+
     def __init__(
         self,
+        model_cls: Type[nn.Module] = LeNet5ReLU,
+        optimizer_name: str = "sgd",
         lr: float = 0.01,
+        weight_decay: float = 0.0,
         epochs: int = 25,
         batch_size: int = 32,
         seed: int = SEED,
         device: torch.device = DEVICE,
     ):
+        self.model_cls = model_cls
+        self.optimizer_name = optimizer_name.lower()
         self.lr = lr
+        self.weight_decay = weight_decay
         self.epochs = epochs
         self.batch_size = batch_size
         self.seed = seed
         self.device = device
-        self.model: Optional[LeNet5ReLU] = None
+        self.model: Optional[nn.Module] = None
 
-    def fit(self, train_images: np.ndarray, train_labels: np.ndarray) -> "LeNet5ReLUClassifier":
+    def fit(self, train_images: np.ndarray, train_labels: np.ndarray) -> "HistologyClassifier":
+        """
+        Entrena el modelo en el conjunto de entrenamiento de UN pliegue.
+        
+        Aislamiento y cero fuga:
+        - Fijamos la semilla en cada pliegue para asegurar reproducibilidad.
+        - Los pesos de compensacion del desbalance se calculan SOLO con train_labels.
+        """
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
-        self.model = LeNet5ReLU(in_channels=3, num_classes=2).to(self.device)
 
-        # Mismos pesos balanceados (1:7) calculados estrictamente con train
+        # 1. Instanciar la red neuronal limpia para este pliegue
+        self.model = self.model_cls(in_channels=3, num_classes=2).to(self.device)
+
+        # 2. Pesos balanceados (inversos a la frecuencia) calculados solo con train
+        #    Compensa el desbalance 1:7 entre TUMOR (625) y NO TUMOR (4.375)
         classes = np.unique(train_labels)
         weights = class_weight.compute_class_weight(class_weight="balanced", classes=classes, y=train_labels)
         weight_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device)
-
         criterion = nn.CrossEntropyLoss(weight=weight_tensor)
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr)
 
+        # 3. Configuracion del optimizador segun el experimento
+        if self.optimizer_name == "sgd":
+            # Descenso por Gradiente Estocastico clasico
+            optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        elif self.optimizer_name == "adam":
+            # Momentos adaptativos (media e inercia del gradiente por parametro)
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        elif self.optimizer_name == "adamw":
+            # Momentos adaptativos con decaimiento de pesos desacoplado (regularizacion limpia)
+            optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        else:
+            raise ValueError(f"Optimizador no soportado: {self.optimizer_name}")
+
+        # 4. DataLoader para procesar lote a lote sin saturar la memoria GPU/MPS
         train_dataset = ColorectalDataset(train_images, train_labels, transform=None)
         train_loader = DataLoader(
             train_dataset,
@@ -251,6 +290,7 @@ class LeNet5ReLUClassifier:
             generator=torch.Generator().manual_seed(self.seed),
         )
 
+        # 5. Bucle de entrenamiento por epocas
         self.model.train()
         for epoch in range(1, self.epochs + 1):
             for batch_imgs, batch_y in train_loader:
@@ -266,6 +306,10 @@ class LeNet5ReLUClassifier:
         return self
 
     def predict_proba(self, test_images: np.ndarray) -> np.ndarray:
+        """
+        Calcula la probabilidad continua de la clase positiva (TUMOR, clase 1)
+        aplicando la funcion Softmax real, sin ningun redondeo.
+        """
         assert self.model is not None, "El modelo debe estar entrenado antes de predecir."
         self.model.eval()
 
@@ -277,115 +321,39 @@ class LeNet5ReLUClassifier:
             for batch_imgs, _ in test_loader:
                 batch_imgs = batch_imgs.to(self.device)
                 logits = self.model(batch_imgs)
-                probs = torch.softmax(logits, dim=1)[:, 1]  # Probabilidad continua de TUMOR
+                # Softmax continuo: seleccionamos la columna 1 (probabilidad de TUMOR)
+                probs = torch.softmax(logits, dim=1)[:, 1]
                 probs_list.append(probs.cpu().numpy())
 
         return np.concatenate(probs_list)
 
     def predict(self, test_images: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+        """
+        Prediccion discreta (0 o 1) aplicando el umbral clinico estandar (0.5).
+        """
         probs = self.predict_proba(test_images)
         return (probs >= threshold).astype(int)
 
 
-# Envoltorio de entrenamiento y prediccion para LeNet-5
-class LeNet5BaselineClassifier:
-    def __init__(
-        self,
-        lr: float = 0.01,
-        epochs: int = 25,
-        batch_size: int = 32,
-        seed: int = SEED,
-        device: torch.device = DEVICE,
-    ):
-        self.lr = lr
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.seed = seed
-        self.device = device
-        self.model: Optional[LeNet5] = None
+# Fabricas de conveniencia para invocar cada configuracion experimental
+def BaselineLeNet5Classifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
+    """Modelo Base: LeNet-5 original con Sigmoid y SGD (lr=0.01)"""
+    return HistologyClassifier(model_cls=LeNet5, optimizer_name="sgd", lr=lr, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
 
-    # Entrena LeNet-5 sobre el conjunto de entrenamiento de UN pliegue
-    def fit(self, train_images: np.ndarray, train_labels: np.ndarray) -> "LeNet5BaselineClassifier":
-        """
-        Aislamiento y cero fuga:
-        - Fijamos la semilla en cada pliegue.
-        - Los pesos de compensacion del desbalance se calculan SOLO con train_labels.
-        """
-        # Reinicia las semillas randoms, y crea una nueva red LeNet
-        torch.manual_seed(self.seed)
-        np.random.seed(self.seed)
-        self.model = LeNet5(in_channels=3, num_classes=2).to(self.device)
+def LeNet5ReLUClassifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
+    """Mejora 1: LeNet-5 con ReLU y SGD (lr=0.01)"""
+    return HistologyClassifier(model_cls=LeNet5ReLU, optimizer_name="sgd", lr=lr, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
 
-        # Evita que la red ignore a la clase con menos imagenes (TUMOR)
-        classes = np.unique(train_labels)
-        # Calcula un "Multiplicador de castigo" inverso a la cantidad de imagenes de cada clase
-        #   Clase 0 (mayoritaria): Como hay muchas, le da un peso bajo. Equivocarse duele menos
-        #   Clase 1 (minoritaria): Como hay pocas, le da un peso alto. Equivocarse multiplica el error, haciendo que la red le preste mucha atencion
-        weights = class_weight.compute_class_weight(class_weight="balanced", classes=classes, y=train_labels)
-        # compute_class_weight devuelve un array de NumPy, entonces lo traduce al formato Tensor
-        weight_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device)
+def LeNet5ReLUAdamClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
+    """Experimento 2A: LeNet-5 con ReLU y Adam (lr=0.001)"""
+    return HistologyClassifier(model_cls=LeNet5ReLU, optimizer_name="adam", lr=lr, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
 
-        # CrossEntropyLoss ponderada con SGD (lr=0.01) sin momentum
-        criterion = nn.CrossEntropyLoss(weight=weight_tensor) # Mide el error usando los pesos anteriores y los logits
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr) # ajusta los parametros de la red
-
-        train_dataset = ColorectalDataset(train_images, train_labels, transform=None)
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            generator=torch.Generator().manual_seed(self.seed),
-        )
-
-        self.model.train()
-        for epoch in range(1, self.epochs + 1):
-            for batch_imgs, batch_y in train_loader:
-                batch_imgs = batch_imgs.to(self.device)
-                batch_y = batch_y.to(self.device)
-
-                optimizer.zero_grad() # limpia calculos anteriores
-                logits = self.model(batch_imgs) # Pasa las imagenes por la red (ejecutando el forward) y obtiene las puntuaciones
-                loss = criterion(logits, batch_y) # COmpara los logits con las etiqeutas reales, para calcular la perdida
-                loss.backward() # Calcula cuanto contribuye cada neurona al error
-                optimizer.step() # Actualiza los pesos de la red para intentar hacerlo mejor en el siguiente batch
-
-        return self
-
-    
-    # Calcula y devuelve la probabilidad continua real para la clase TUMOR (clase 1)    
-    def predict_proba(self, test_images: np.ndarray) -> np.ndarray:
-        """
-        Importante para la defensa:
-        - No redondeamos con np.round. Usamos softmax real continuo.
-        - Devolvemos la probabilidad de TUMOR (columna 1), que es la diana clinica.
-        """
-        assert self.model is not None, "El modelo debe estar entrenado antes de predecir."
-        self.model.eval()
-
-        test_dataset = ColorectalDataset(test_images, np.zeros(len(test_images), dtype=int), transform=None)
-        test_loader = DataLoader(
-            test_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False
-        )
-
-        probs_list = []
-        with torch.no_grad(): # deja de hacer calculos
-            for batch_imgs, _ in test_loader:
-                batch_imgs = batch_imgs.to(self.device)
-                logits = self.model(batch_imgs) # Obtiene las puntuaciones
-                # Softmax para obtener la distribucion de probabilidad continua
-                probs = torch.softmax(logits, dim=1)[:, 1]  # Probabilidad de clase 1 (TUMOR)
-                probs_list.append(probs.cpu().numpy())
-
-        return np.concatenate(probs_list)
+def LeNet5ReLUAdamWClassifier(lr=0.001, weight_decay=1e-4, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
+    """Experimento 2B: LeNet-5 con ReLU y AdamW (lr=0.001, weight_decay=1e-4)"""
+    return HistologyClassifier(model_cls=LeNet5ReLU, optimizer_name="adamw", lr=lr, weight_decay=weight_decay, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
 
 
-    # Genera las etiquetas binarias discretas (0 o 1) aplicando el umbral de decision
-    def predict(self, test_images: np.ndarray, threshold: float = 0.5) -> np.ndarray:
-        probs = self.predict_proba(test_images)
-        # Compara contra el umbral de decision (50%), si es >= -> 1 TUMOR, si < 0 NO TUMOR
-        return (probs >= threshold).astype(int)
+
 
 
 
@@ -559,30 +527,83 @@ def main():
         baseline_oof_df.to_csv(RESULTS_DIR / "baseline_lenet5_oof.csv", index=False)
         summarize_results(baseline_metrics_df).to_csv(RESULTS_DIR / "baseline_lenet5_summary.csv")
 
-    # 4. MEJORA 1: LeNet-5 con activaciones ReLU
-    def create_relu():
-        return LeNet5ReLUClassifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
-
-    relu_metrics_df, relu_oof_df = evaluate_cv(
-        model_name="lenet5_relu",
-        model_factory=create_relu,
-        images=images_32,
-        labels=labels_bin,
-        splits=splits,
-        return_oof=True,
-    )
-
-    # Guardar resultados de LeNet-5 ReLU
+    # 4. MEJORA 1: LeNet-5 con activaciones ReLU y SGD (Cargar si ya existe)
     relu_cv_file = RESULTS_DIR / "lenet5_relu_cv_results.csv"
     relu_oof_file = RESULTS_DIR / "lenet5_relu_oof.csv"
     relu_summary_file = RESULTS_DIR / "lenet5_relu_summary.csv"
 
-    relu_metrics_df.to_csv(relu_cv_file, index=False)
-    relu_oof_df.to_csv(relu_oof_file, index=False)
-    summarize_results(relu_metrics_df).to_csv(relu_summary_file)
+    if relu_cv_file.exists() and relu_oof_file.exists():
+        print("\nCargando resultados previos de LeNet-5 ReLU (SGD) desde disco...")
+        relu_metrics_df = pd.read_csv(relu_cv_file)
+        relu_oof_df = pd.read_csv(relu_oof_file)
+    else:
+        def create_relu():
+            return LeNet5ReLUClassifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
 
-    # 5. TABLA COMPARATIVA CONSOLIDADA (10-CV)
-    all_metrics = pd.concat([baseline_metrics_df, relu_metrics_df], ignore_index=True)
+        relu_metrics_df, relu_oof_df = evaluate_cv(
+            model_name="lenet5_relu",
+            model_factory=create_relu,
+            images=images_32,
+            labels=labels_bin,
+            splits=splits,
+            return_oof=True,
+        )
+        relu_metrics_df.to_csv(relu_cv_file, index=False)
+        relu_oof_df.to_csv(relu_oof_file, index=False)
+        summarize_results(relu_metrics_df).to_csv(relu_summary_file)
+
+    # 5. EXPERIMENTO 2A: LeNet-5 ReLU con optimizador Adam (lr=0.001)
+    adam_cv_file = RESULTS_DIR / "lenet5_relu_adam_cv_results.csv"
+    adam_oof_file = RESULTS_DIR / "lenet5_relu_adam_oof.csv"
+    adam_summary_file = RESULTS_DIR / "lenet5_relu_adam_summary.csv"
+
+    if adam_cv_file.exists() and adam_oof_file.exists():
+        print("\nCargando resultados previos de LeNet-5 ReLU (Adam) desde disco...")
+        adam_metrics_df = pd.read_csv(adam_cv_file)
+        adam_oof_df = pd.read_csv(adam_oof_file)
+    else:
+        def create_adam():
+            return LeNet5ReLUAdamClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+
+        adam_metrics_df, adam_oof_df = evaluate_cv(
+            model_name="lenet5_relu_adam",
+            model_factory=create_adam,
+            images=images_32,
+            labels=labels_bin,
+            splits=splits,
+            return_oof=True,
+        )
+        adam_metrics_df.to_csv(adam_cv_file, index=False)
+        adam_oof_df.to_csv(adam_oof_file, index=False)
+        summarize_results(adam_metrics_df).to_csv(adam_summary_file)
+
+    # 6. EXPERIMENTO 2B: LeNet-5 ReLU con optimizador AdamW (lr=0.001, weight_decay=1e-4)
+    adamw_cv_file = RESULTS_DIR / "lenet5_relu_adamw_cv_results.csv"
+    adamw_oof_file = RESULTS_DIR / "lenet5_relu_adamw_oof.csv"
+    adamw_summary_file = RESULTS_DIR / "lenet5_relu_adamw_summary.csv"
+
+    if adamw_cv_file.exists() and adamw_oof_file.exists():
+        print("\nCargando resultados previos de LeNet-5 ReLU (AdamW) desde disco...")
+        adamw_metrics_df = pd.read_csv(adamw_cv_file)
+        adamw_oof_df = pd.read_csv(adamw_oof_file)
+    else:
+        def create_adamw():
+            return LeNet5ReLUAdamWClassifier(lr=0.001, weight_decay=1e-4, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+
+        adamw_metrics_df, adamw_oof_df = evaluate_cv(
+            model_name="lenet5_relu_adamw",
+            model_factory=create_adamw,
+            images=images_32,
+            labels=labels_bin,
+            splits=splits,
+            return_oof=True,
+        )
+        adamw_metrics_df.to_csv(adamw_cv_file, index=False)
+        adamw_oof_df.to_csv(adamw_oof_file, index=False)
+        summarize_results(adamw_metrics_df).to_csv(adamw_summary_file)
+
+    # 7. TABLA COMPARATIVA CONSOLIDADA (10-CV)
+    all_metrics = pd.concat([baseline_metrics_df, relu_metrics_df, adam_metrics_df, adamw_metrics_df], ignore_index=True)
     summary_all = summarize_results(all_metrics)
 
     print("\n" + "=" * 65)
@@ -590,26 +611,34 @@ def main():
     print(summary_all.to_string())
     print("=" * 65)
 
-    # 6. CONTRASTE ESTADISTICO DE WILCOXON (Mejora 1 vs Baseline)
-    w_res = wilcoxon_compare(all_metrics, "lenet5_relu", "baseline_lenet5", metric="roc_auc")
-    print("\n" + "-" * 65)
-    print("TEST DE RANGOS CON SIGNO DE WILCOXON (Metrica: ROC-AUC, N=10):")
-    print(f"  Modelo A (lenet5_relu) vs. Modelo B (baseline_lenet5)")
-    print(f"  Pliegues donde ReLU gana a Baseline: {w_res['folds_a_better']} / 10")
-    print(f"  Diferencia de medianas (ReLU - Baseline): {w_res['median_diff_a_minus_b']:+.4f}")
-    print(f"  p-valor: {w_res['p_value']:.5f}")
-    if w_res['p_value'] < 0.05:
-        print("  Veredicto: La diferencia es ESTADISTICAMENTE SIGNIFICATIVA (p < 0.05)")
-    else:
-        print("  Veredicto: La diferencia NO es estadisticamente significativa (p >= 0.05)")
-    print("-" * 65)
+    # 8. CONTRASTES ESTADISTICOS DE WILCOXON (N=10 pliegues)
+    print("\n" + "=" * 65)
+    print("TEST DE RANGOS CON SIGNO DE WILCOXON (Metrica: ROC-AUC, N=10)")
+    print("=" * 65)
 
-    # 7. Matriz de confusion global de LeNet-5 ReLU sobre las 5.000 instancias OOF
-    cm = metrics.confusion_matrix(relu_oof_df["y_true"], relu_oof_df["y_pred"])
-    print("\nMatriz de confusion global de LeNet-5 ReLU (5.000 instancias OOF):")
-    print("                     Pred: NO TUMOR (0)    Pred: TUMOR (1)")
-    print(f"Real: NO TUMOR (0)          {cm[0, 0]:5d}               {cm[0, 1]:5d}")
-    print(f"Real: TUMOR (1)             {cm[1, 0]:5d}               {cm[1, 1]:5d}")
+    comparisons = [
+        ("lenet5_relu", "baseline_lenet5", "Mejora 1 (ReLU) vs. Baseline (Sigmoid)"),
+        ("lenet5_relu_adam", "lenet5_relu", "Exp 2A (Adam) vs. Mejora 1 (SGD)"),
+        ("lenet5_relu_adamw", "lenet5_relu_adam", "Exp 2B (AdamW) vs. Exp 2A (Adam)"),
+        ("lenet5_relu_adamw", "baseline_lenet5", "Exp 2B (AdamW) vs. Baseline (Sigmoid)"),
+    ]
+
+    for mod_a, mod_b, desc in comparisons:
+        w_res = wilcoxon_compare(all_metrics, mod_a, mod_b, metric="roc_auc")
+        sig = "ESTADISTICAMENTE SIGNIFICATIVA (p < 0.05)" if w_res['p_value'] < 0.05 else "NO significativa (p >= 0.05)"
+        print(f"\n* {desc}:")
+        print(f"  Victorias de {mod_a}: {w_res['folds_a_better']} / 10 | Dif. medianas: {w_res['median_diff_a_minus_b']:+.4f} | p-valor: {w_res['p_value']:.5f}")
+        print(f"  Veredicto: {sig}")
+
+    print("\n" + "=" * 65)
+    print("MATRICES DE CONFUSION GLOBALES OOF (5.000 instancias por modelo):")
+    print("=" * 65)
+    for name, df_oof in [("LeNet-5 ReLU (SGD)", relu_oof_df), ("LeNet-5 ReLU (Adam)", adam_oof_df), ("LeNet-5 ReLU (AdamW)", adamw_oof_df)]:
+        cm = metrics.confusion_matrix(df_oof["y_true"], df_oof["y_pred"])
+        print(f"\n{name}:")
+        print("                     Pred: NO TUMOR (0)    Pred: TUMOR (1)")
+        print(f"Real: NO TUMOR (0)          {cm[0, 0]:5d}               {cm[0, 1]:5d}")
+        print(f"Real: TUMOR (1)             {cm[1, 0]:5d}               {cm[1, 1]:5d}")
 
 
 if __name__ == "__main__":
