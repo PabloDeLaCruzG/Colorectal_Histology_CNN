@@ -77,8 +77,8 @@ Para garantizar estimaciones insesgadas, se aplica una validación cruzada estra
   3. Estas mismas particiones se reutilizan idénticas en el Nivel Medio, garantizando la consistencia estadística entre fases.
 
 ### 3.2 Prevención de fuga de datos (Zero Data Leakage)
-1. **Estadísticos de clase:** La ponderación de la función de pérdida para compensar el desbalance se calcula en cada pliegue $k$ utilizando única y exclusivamente las etiquetas de entrenamiento (`train_labels`), sin consultar jamás el conjunto de test.
-2. **Normalización:** La transformación lineal a $[0.0, 1.0]$ mediante división por 255.0 es una escala fija y determinista sin estado (*stateless*), por lo que no introduce filtración entre conjuntos.
+1. **Estadísticos de clase:** La ponderación de la función de pérdida para compensar el desbalance se calcula en cada pliegue k utilizando única y exclusivamente las etiquetas de entrenamiento (`train_labels`), sin consultar jamás el conjunto de test.
+2. **Normalización:** La transformación lineal a [0.0, 1.0] mediante división por 255.0 es una escala fija y determinista sin estado (*stateless*), por lo que no introduce filtración entre conjuntos.
 3. **Aislamiento en cada iteración:** Se utiliza el patrón de diseño de fábrica (`model_factory`), instanciando un modelo completamente nuevo con pesos reinicializados en cada pliegue.
 
 ### 3.3 Protocolo estadístico y cálculo de ROC-AUC
@@ -94,16 +94,16 @@ Para garantizar estimaciones insesgadas, se aplica una validación cruzada estra
 ### 4.1 Topología y parámetros de LeNet-5
 Como punto de partida estipulado por el profesor en `Colorectal_histology_LeNet5_notebook.ipynb`, se replica la arquitectura clásica convolucional LeNet-5 adaptada a imágenes en color RGB (3 canales):
 1. **Entrada:** Imágenes redimensionadas a **32×32** píxeles.
-2. **Bloque Convolucional 1:** `Conv2D(3, 6, kernel=5x5)` + activación `Sigmoid` + `MaxPool2d(2x2, stride=2)` $\to$ Mapa de características de salida: $(6, 14, 14)$.
-3. **Bloque Convolucional 2:** `Conv2D(6, 16, kernel=5x5)` + activación `Sigmoid` + `MaxPool2d(2x2, stride=2)` $\to$ Mapa de características de salida: $(16, 5, 5)$.
-4. **Capa de aplanado (*Flatten*):** Vector unidimensional de $16 \times 5 \times 5 = 400$ características.
+2. **Bloque Convolucional 1:** `Conv2D(3, 6, kernel=5x5)` + activación `Sigmoid` + `MaxPool2d(2x2, stride=2)` → Mapa de características de salida: (6, 14, 14).
+3. **Bloque Convolucional 2:** `Conv2D(6, 16, kernel=5x5)` + activación `Sigmoid` + `MaxPool2d(2x2, stride=2)` → Mapa de características de salida: (16, 5, 5).
+4. **Capa de aplanado (*Flatten*):** Vector unidimensional de 16 × 5 × 5 = 400 características.
 5. **Capa Densa 1:** `Linear(400, 120)` + activación `Sigmoid`.
 6. **Capa Densa 2:** `Linear(120, 84)` + activación `Sigmoid`.
 7. **Capa Densa de Salida:** `Linear(84, 2)` (produce los logits no normalizados para la clasificación binaria).
 * **Parámetros totales entrenables:** **61.326 pesos**.
 
 ### 4.2 Hiperparámetros del Baseline
-* **Optimizador:** Descenso por Gradiente Estocástico (`SGD`) con tasa de aprendizaje fija $lr = 0,01$, sin momentum ni decaimiento de pesos.
+* **Optimizador:** Descenso por Gradiente Estocástico (`SGD`) con tasa de aprendizaje fija lr = 0,01, sin momentum ni decaimiento de pesos.
 * **Épocas:** 25 épocas por pliegue.
 * **Tamaño de lote (*batch size*):** 32 muestras.
 * **Pérdida:** `nn.CrossEntropyLoss(weight=weight_tensor)` donde los pesos de clase se calculan como w_c = N / (C · N_c), resultando en pesos aproximados de w_0 ≈ 0,57 y w_1 ≈ 4,00 (relación 1:7).
@@ -148,6 +148,25 @@ El análisis cuantitativo de las probabilidades predichas `y_prob` sobre las 5.0
 La combinación de activaciones Sigmoid y optimizador SGD básico provoca un severo **desvanecimiento del gradiente**. La derivada de la sigmoide σ'(z) ≤ 0,25 reduce exponencialmente el gradiente que retropropaga hacia las primeras capas (≈ 0,25⁴ ≈ 0,0039). Como consecuencia, los pesos no logran escalar los logits de salida lo suficiente como para vencer el umbral estándar de decisión τ = 0,5. Todas las predicciones discretas se asignan a la clase 0, provocando un F1 = 0.
 
 Sin embargo, el gradiente sí fue suficiente para orientar los pesos en la dirección correcta: las muestras tumorales reciben sistemáticamente probabilidades mayores que las sanas. Debido a que el **ROC-AUC mide la concordancia de rangos (estadístico U de Mann-Whitney)** a lo largo de todos los umbrales posibles, la red alcanza un meritorio **0,8218**, demostrando que extrae patrones discriminativos pero carece de calibración en la capa de salida.
+
+### 4.6 Contraste directo con el notebook de referencia del profesor
+Para verificar empíricamente la fidelidad de nuestro arnés experimental frente al material docente oficial, se ejecutó una réplica estricta del notebook de referencia (`Colorectal_histology_LeNet5_notebook.ipynb`):
+
+* **Configuración del notebook original:**
+  1. Partición única 75/25 (`train_test_split(random_state=42)`) sin validación cruzada: 3.750 muestras de entrenamiento y 1.250 muestras de test (177 TUMOR, 1.073 NO TUMOR).
+  2. Mapeo de etiquetas: `y[y > 0] = 1`, asignando la clase 0 a TUMOR y la clase 1 a NO TUMOR.
+  3. Mismo optimizador SGD (lr = 0,01), tamaño de lote 32 y 25 épocas con pesos ponderados (`class_weight='balanced'`).
+
+| Configuración experimental | Partición | Accuracy | Recall (TUMOR) | F1-Score | ROC-AUC reportado | ROC-AUC continuo real |
+|---|---|---|---|---|---|---|
+| **Notebook del profesor** | Split 75/25 único | 85,84 % | 0,00 % (0 / 177) | 0,0000 | **0,5000** (con `np.round`) | **0,8411** |
+| **Nuestro Baseline PyTorch** | 10-CV estratificada | 87,50 ± 0,0011 | 0,00 % (0 / 625) | 0,0000 | — | **0,8218 ± 0,0291** |
+
+* **Hallazgo crítico sobre el cálculo del ROC-AUC en el notebook docente:**
+  En la celda 38 del notebook de referencia, el cálculo se implementa como `metrics.roc_auc_score(y_test, np.round(y_scores[:, 1], 2))`. Debido a que las activaciones sigmoides confinan las probabilidades en un rango infinitesimal alrededor de 0,45 (rango dinámico < 0,001), la función `np.round(..., 2)` convierte todas las probabilidades predichas a exactamente 0,45. Al destruirse la ordenación ordinal de las probabilidades continuas, el estimador ROC-AUC colapsa a **0,5000** (azar absoluto). Al corregir este artefacto y evaluar sobre las probabilidades continuas originales, el modelo del profesor alcanza en realidad un **ROC-AUC de 0,8411**, un valor plenamente concordante y dentro del intervalo de variabilidad de nuestra validación cruzada 10-CV (0,8218 ± 0,0291).
+
+* **Relevancia histórica y pedagógica de LeNet-5:**
+  LeNet-5 fue diseñada por Yann LeCun en 1998 para el reconocimiento de dígitos manuscritos en MNIST (imágenes en escala de grises de 28×28, clases balanceadas al 10 % cada una y fondos limpios de alto contraste). Su aplicación directa en histología digital colorrectal (imágenes complejas RGB con severo desbalance 1:7) representa intencionadamente un modelo base de compromiso (*strawman baseline*). Este punto de partida permite evidenciar de manera inequívoca los dos grandes cuellos de botella del aprendizaje profundo anterior a 2012: el **desvanecimiento de gradiente** en arquitecturas con funciones de activación sigmoides y el **colapso trivial** hacia la clase mayoritaria en problemas biomédicos desbalanceados.
 
 ---
 
