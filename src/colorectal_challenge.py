@@ -180,8 +180,42 @@ class LeNet5(nn.Module):
         return x
 
 
-# Envoltorio de entrenamiento y prediccion para LeNet-5
-class LeNet5BaselineClassifier:
+# -------------------------------------------------------------
+# MEJORA 1: LeNet-5 con activaciones ReLU
+# -------------------------------------------------------------
+# Misma arquitectura y parametros (61.326 pesos), pero sustituyendo
+# las sigmoides por ReLU para resolver el desvanecimiento del gradiente.
+class LeNet5ReLU(nn.Module):
+    def __init__(self, in_channels: int = 3, num_classes: int = 2):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=6, kernel_size=5)
+        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        # ReLU: derivada = 1 para valores > 0, el gradiente no se reduce a 0.25
+        self.relu = nn.ReLU()
+
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Bloque convolucional 1 con ReLU
+        x = self.pool(self.relu(self.conv1(x)))
+        # Bloque convolucional 2 con ReLU
+        x = self.pool(self.relu(self.conv2(x)))
+
+        # Aplanado a vector 1D
+        x = torch.flatten(x, start_dim=1)
+
+        # Capas densas con ReLU
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)  # Logits de salida
+        return x
+
+
+# Envoltorio de entrenamiento y prediccion para LeNet-5 ReLU
+class LeNet5ReLUClassifier:
     def __init__(
         self,
         lr: float = 0.01,
@@ -195,28 +229,18 @@ class LeNet5BaselineClassifier:
         self.batch_size = batch_size
         self.seed = seed
         self.device = device
-        self.model: Optional[LeNet5] = None
+        self.model: Optional[LeNet5ReLU] = None
 
-    def fit(self, train_images: np.ndarray, train_labels: np.ndarray) -> "LeNet5BaselineClassifier":
-        """
-        Entrena LeNet-5 sobre el conjunto de entrenamiento de un pliegue.
-        
-        Aislamiento y cero fuga:
-        - Fijamos la semilla en cada pliegue.
-        - Los pesos de compensacion del desbalance se calculan SOLO con train_labels.
-        """
+    def fit(self, train_images: np.ndarray, train_labels: np.ndarray) -> "LeNet5ReLUClassifier":
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
+        self.model = LeNet5ReLU(in_channels=3, num_classes=2).to(self.device)
 
-        self.model = LeNet5(in_channels=3, num_classes=2).to(self.device)
-
-        # Calculo de pesos balanceados para la funcion de perdida (equivalente a class_weight='balanced')
-        # Formula: peso_c = N / (C * N_c). Para desbalance 1:7 da aprox [0.57, 4.00]
+        # Mismos pesos balanceados (1:7) calculados estrictamente con train
         classes = np.unique(train_labels)
         weights = class_weight.compute_class_weight(class_weight="balanced", classes=classes, y=train_labels)
         weight_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device)
 
-        # CrossEntropyLoss ponderada con SGD (lr=0.01) sin momentum, exactamente como el profesor
         criterion = nn.CrossEntropyLoss(weight=weight_tensor)
         optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr)
 
@@ -243,13 +267,6 @@ class LeNet5BaselineClassifier:
         return self
 
     def predict_proba(self, test_images: np.ndarray) -> np.ndarray:
-        """
-        Calcula y devuelve la probabilidad continua real para la clase TUMOR (clase 1).
-        
-        Importante para la defensa:
-        - No redondeamos con np.round. Usamos softmax real continuo.
-        - Devolvemos la probabilidad de TUMOR (columna 1), que es la diana clinica.
-        """
         assert self.model is not None, "El modelo debe estar entrenado antes de predecir."
         self.model.eval()
 
@@ -261,23 +278,124 @@ class LeNet5BaselineClassifier:
             for batch_imgs, _ in test_loader:
                 batch_imgs = batch_imgs.to(self.device)
                 logits = self.model(batch_imgs)
+                probs = torch.softmax(logits, dim=1)[:, 1]  # Probabilidad continua de TUMOR
+                probs_list.append(probs.cpu().numpy())
+
+        return np.concatenate(probs_list)
+
+    def predict(self, test_images: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+        probs = self.predict_proba(test_images)
+        return (probs >= threshold).astype(int)
+
+
+# Envoltorio de entrenamiento y prediccion para LeNet-5
+class LeNet5BaselineClassifier:
+    def __init__(
+        self,
+        lr: float = 0.01,
+        epochs: int = 25,
+        batch_size: int = 32,
+        seed: int = SEED,
+        device: torch.device = DEVICE,
+    ):
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.seed = seed
+        self.device = device
+        self.model: Optional[LeNet5] = None
+
+    # Entrena LeNet-5 sobre el conjunto de entrenamiento de UN pliegue
+    def fit(self, train_images: np.ndarray, train_labels: np.ndarray) -> "LeNet5BaselineClassifier":
+        """
+        Aislamiento y cero fuga:
+        - Fijamos la semilla en cada pliegue.
+        - Los pesos de compensacion del desbalance se calculan SOLO con train_labels.
+        """
+        # Reinicia las semillas randoms, y crea una nueva red LeNet
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        self.model = LeNet5(in_channels=3, num_classes=2).to(self.device)
+
+        # Evita que la red ignore a la clase con menos imagenes (TUMOR)
+        classes = np.unique(train_labels)
+        # Calcula un "Multiplicador de castigo" inverso a la cantidad de imagenes de cada clase
+        #   Clase 0 (mayoritaria): Como hay muchas, le da un peso bajo. Equivocarse duele menos
+        #   Clase 1 (minoritaria): Como hay pocas, le da un peso alto. Equivocarse multiplica el error, haciendo que la red le preste mucha atencion
+        weights = class_weight.compute_class_weight(class_weight="balanced", classes=classes, y=train_labels)
+        # compute_class_weight devuelve un array de NumPy, entonces lo traduce al formato Tensor
+        weight_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device)
+
+        # CrossEntropyLoss ponderada con SGD (lr=0.01) sin momentum
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor) # Mide el error usando los pesos anteriores y los logits
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr) # ajusta los parametros de la red
+
+        train_dataset = ColorectalDataset(train_images, train_labels, transform=None)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(self.seed),
+        )
+
+        self.model.train()
+        for epoch in range(1, self.epochs + 1):
+            for batch_imgs, batch_y in train_loader:
+                batch_imgs = batch_imgs.to(self.device)
+                batch_y = batch_y.to(self.device)
+
+                optimizer.zero_grad() # limpia calculos anteriores
+                logits = self.model(batch_imgs) # Pasa las imagenes por la red (ejecutando el forward) y obtiene las puntuaciones
+                loss = criterion(logits, batch_y) # COmpara los logits con las etiqeutas reales, para calcular la perdida
+                loss.backward() # Calcula cuanto contribuye cada neurona al error
+                optimizer.step() # Actualiza los pesos de la red para intentar hacerlo mejor en el siguiente batch
+
+        return self
+
+    
+    # Calcula y devuelve la probabilidad continua real para la clase TUMOR (clase 1)    
+    def predict_proba(self, test_images: np.ndarray) -> np.ndarray:
+        """
+        Importante para la defensa:
+        - No redondeamos con np.round. Usamos softmax real continuo.
+        - Devolvemos la probabilidad de TUMOR (columna 1), que es la diana clinica.
+        """
+        assert self.model is not None, "El modelo debe estar entrenado antes de predecir."
+        self.model.eval()
+
+        test_dataset = ColorectalDataset(test_images, np.zeros(len(test_images), dtype=int), transform=None)
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=False
+        )
+
+        probs_list = []
+        with torch.no_grad(): # deja de hacer calculos
+            for batch_imgs, _ in test_loader:
+                batch_imgs = batch_imgs.to(self.device)
+                logits = self.model(batch_imgs) # Obtiene las puntuaciones
                 # Softmax para obtener la distribucion de probabilidad continua
                 probs = torch.softmax(logits, dim=1)[:, 1]  # Probabilidad de clase 1 (TUMOR)
                 probs_list.append(probs.cpu().numpy())
 
         return np.concatenate(probs_list)
 
+
+    # Genera las etiquetas binarias discretas (0 o 1) aplicando el umbral de decision
     def predict(self, test_images: np.ndarray, threshold: float = 0.5) -> np.ndarray:
-        """Genera las etiquetas binarias discretas (0 o 1) aplicando el umbral de decision."""
         probs = self.predict_proba(test_images)
+        # Compara contra el umbral de decision (50%), si es >= -> 1 TUMOR, si < 0 NO TUMOR
         return (probs >= threshold).astype(int)
+
 
 
 # ---------------------------------------------------------------------------
 # 4. ARNES DE VALIDACION CRUZADA (10-CV) Y METRICAS
 # ---------------------------------------------------------------------------
+
+# Calcula las metricas requeridas: ROC-AUC continua, Accuracy y F1-Score
 def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndarray | None = None) -> dict:
-    """Calcula las metricas requeridas: ROC-AUC continua, Accuracy y F1-Score."""
     if y_pred is None:
         y_pred = (y_prob >= 0.5).astype(int)
 
@@ -296,6 +414,7 @@ def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndarray |
     }
 
 
+# Arnes de validacion cruzada de 10 pliegues (10-CV)
 def evaluate_cv(
     model_name: str,
     model_factory: Callable,
@@ -304,13 +423,7 @@ def evaluate_cv(
     splits: list[dict],
     return_oof: bool = True,
 ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Arnes de validacion cruzada de 10 pliegues (10-CV).
-    
-    Replicado del diseno usado en NLP:
-    - model_factory(): genera un objeto nuevo y limpio en cada pliegue.
-    - return_oof: genera la tabla Out-Of-Fold con las 5.000 predicciones completas.
-    """
+
     rows = []
     oof_rows = []
 
@@ -373,8 +486,8 @@ def evaluate_cv(
     return metrics_df
 
 
+# Calcula la media y desviacion tipica entre los 10 pliegues
 def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
-    """Calcula la media y desviacion tipica entre los 10 pliegues."""
     summary = results.groupby("model").agg(
         roc_auc_mean=("roc_auc", "mean"),
         roc_auc_std=("roc_auc", "std"),
@@ -386,12 +499,9 @@ def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
     return summary.round(4)
 
 
+# Test de rangos con signo de Wilcoxon sobre pliegues emparejados
+# Comprueba si la diferencia entre dos modelos en los 10 pliegues es estadisticamente significativa
 def wilcoxon_compare(results: pd.DataFrame, model_a: str, model_b: str, metric: str = "roc_auc") -> dict:
-    """
-    Test de rangos con signo de Wilcoxon sobre pliegues emparejados.
-    
-    Comprueba si la diferencia entre dos modelos en los 10 pliegues es estadisticamente significativa.
-    """
     a = results[results["model"] == model_a].sort_values("fold")[metric].to_numpy()
     b = results[results["model"] == model_b].sort_values("fold")[metric].to_numpy()
     assert len(a) == len(b), "Los dos modelos deben haber sido evaluados sobre los mismos pliegues."
@@ -429,39 +539,75 @@ def main():
     images_32 = np.stack([np.array(Image.fromarray(im).resize((32, 32), Image.BILINEAR)) for im in images_raw])
     print(f"Redimensionado listo en {time.perf_counter() - t0:.2f} s (tamano en RAM: {images_32.nbytes / (1024*1024):.1f} MB)")
 
-    # 3. Definir fabrica del Baseline LeNet-5
-    def create_baseline():
-        return LeNet5BaselineClassifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+    # 3. Baseline LeNet-5 (Cargar si ya existe para no repetir computo, o ejecutar)
+    baseline_cv_file = RESULTS_DIR / "baseline_lenet5_cv_results.csv"
+    if baseline_cv_file.exists():
+        print("\nCargando resultados previos del Baseline LeNet-5 desde disco...")
+        baseline_metrics_df = pd.read_csv(baseline_cv_file)
+    else:
+        def create_baseline():
+            return LeNet5BaselineClassifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
 
-    # 4. Ejecutar validacion cruzada 10-CV
-    metrics_df, oof_df = evaluate_cv(
-        model_name="baseline_lenet5",
-        model_factory=create_baseline,
+        baseline_metrics_df, baseline_oof_df = evaluate_cv(
+            model_name="baseline_lenet5",
+            model_factory=create_baseline,
+            images=images_32,
+            labels=labels_bin,
+            splits=splits,
+            return_oof=True,
+        )
+        baseline_metrics_df.to_csv(baseline_cv_file, index=False)
+        baseline_oof_df.to_csv(RESULTS_DIR / "baseline_lenet5_oof.csv", index=False)
+        summarize_results(baseline_metrics_df).to_csv(RESULTS_DIR / "baseline_lenet5_summary.csv")
+
+    # 4. MEJORA 1: LeNet-5 con activaciones ReLU
+    def create_relu():
+        return LeNet5ReLUClassifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+
+    relu_metrics_df, relu_oof_df = evaluate_cv(
+        model_name="lenet5_relu",
+        model_factory=create_relu,
         images=images_32,
         labels=labels_bin,
         splits=splits,
         return_oof=True,
     )
 
-    # 5. Guardar resultados
-    cv_file = RESULTS_DIR / "baseline_lenet5_cv_results.csv"
-    oof_file = RESULTS_DIR / "baseline_lenet5_oof.csv"
-    summary_file = RESULTS_DIR / "baseline_lenet5_summary.csv"
+    # Guardar resultados de LeNet-5 ReLU
+    relu_cv_file = RESULTS_DIR / "lenet5_relu_cv_results.csv"
+    relu_oof_file = RESULTS_DIR / "lenet5_relu_oof.csv"
+    relu_summary_file = RESULTS_DIR / "lenet5_relu_summary.csv"
 
-    metrics_df.to_csv(cv_file, index=False)
-    oof_df.to_csv(oof_file, index=False)
+    relu_metrics_df.to_csv(relu_cv_file, index=False)
+    relu_oof_df.to_csv(relu_oof_file, index=False)
+    summarize_results(relu_metrics_df).to_csv(relu_summary_file)
 
-    summary_df = summarize_results(metrics_df)
-    summary_df.to_csv(summary_file)
+    # 5. TABLA COMPARATIVA CONSOLIDADA (10-CV)
+    all_metrics = pd.concat([baseline_metrics_df, relu_metrics_df], ignore_index=True)
+    summary_all = summarize_results(all_metrics)
 
-    # 6. Mostrar resumen en consola
     print("\n" + "=" * 65)
-    print("RESUMEN 10-CV DEL BASELINE LeNet-5:")
-    print(summary_df.to_string())
+    print("COMPARATIVA DE MODELOS 10-CV (Media ± Desv. Tipica):")
+    print(summary_all.to_string())
     print("=" * 65)
 
-    cm = metrics.confusion_matrix(oof_df["y_true"], oof_df["y_pred"])
-    print("\nMatriz de confusion global sobre las 5.000 instancias:")
+    # 6. CONTRASTE ESTADISTICO DE WILCOXON (Mejora 1 vs Baseline)
+    w_res = wilcoxon_compare(all_metrics, "lenet5_relu", "baseline_lenet5", metric="roc_auc")
+    print("\n" + "-" * 65)
+    print("TEST DE RANGOS CON SIGNO DE WILCOXON (Metrica: ROC-AUC, N=10):")
+    print(f"  Modelo A (lenet5_relu) vs. Modelo B (baseline_lenet5)")
+    print(f"  Pliegues donde ReLU gana a Baseline: {w_res['folds_a_better']} / 10")
+    print(f"  Diferencia de medianas (ReLU - Baseline): {w_res['median_diff_a_minus_b']:+.4f}")
+    print(f"  p-valor: {w_res['p_value']:.5f}")
+    if w_res['p_value'] < 0.05:
+        print("  Veredicto: La diferencia es ESTADISTICAMENTE SIGNIFICATIVA (p < 0.05)")
+    else:
+        print("  Veredicto: La diferencia NO es estadisticamente significativa (p >= 0.05)")
+    print("-" * 65)
+
+    # 7. Matriz de confusion global de LeNet-5 ReLU sobre las 5.000 instancias OOF
+    cm = metrics.confusion_matrix(relu_oof_df["y_true"], relu_oof_df["y_pred"])
+    print("\nMatriz de confusion global de LeNet-5 ReLU (5.000 instancias OOF):")
     print("                     Pred: NO TUMOR (0)    Pred: TUMOR (1)")
     print(f"Real: NO TUMOR (0)          {cm[0, 0]:5d}               {cm[0, 1]:5d}")
     print(f"Real: TUMOR (1)             {cm[1, 0]:5d}               {cm[1, 1]:5d}")
