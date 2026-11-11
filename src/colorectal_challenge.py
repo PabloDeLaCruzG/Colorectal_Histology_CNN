@@ -247,14 +247,8 @@ class HistologyClassifier:
         self.device = device
         self.model: Optional[nn.Module] = None
 
+    # Entrena el modelo en el conjunto de entrenamiento de UN pliegue
     def fit(self, train_images: np.ndarray, train_labels: np.ndarray) -> "HistologyClassifier":
-        """
-        Entrena el modelo en el conjunto de entrenamiento de UN pliegue.
-        
-        Aislamiento y cero fuga:
-        - Fijamos la semilla en cada pliegue para asegurar reproducibilidad.
-        - Los pesos de compensacion del desbalance se calculan SOLO con train_labels.
-        """
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
@@ -297,11 +291,11 @@ class HistologyClassifier:
                 batch_imgs = batch_imgs.to(self.device)
                 batch_y = batch_y.to(self.device)
 
-                optimizer.zero_grad()
-                logits = self.model(batch_imgs)
-                loss = criterion(logits, batch_y)
-                loss.backward()
-                optimizer.step()
+                optimizer.zero_grad()  # limpia calculos anteriores
+                logits = self.model(batch_imgs) # Pasa las imagenes por la red (ejecutando el forward) y obtiene las puntuaciones
+                loss = criterion(logits, batch_y) # COmpara los logits con las etiqeutas reales, para calcular la perdida loss.backward()
+                loss.backward() # Calcula cuanto contribuye cada neurona al error
+                optimizer.step() # Actualiza los pesos de la red para intentar hacerlo mejor en el siguiente batch
 
         return self
 
@@ -513,7 +507,7 @@ def main():
         baseline_metrics_df = pd.read_csv(baseline_cv_file)
     else:
         def create_baseline():
-            return LeNet5BaselineClassifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+            return BaselineLeNet5Classifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
 
         baseline_metrics_df, baseline_oof_df = evaluate_cv(
             model_name="baseline_lenet5",

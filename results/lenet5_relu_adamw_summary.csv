@@ -1,0 +1,2 @@
+model,roc_auc_mean,roc_auc_std,acc_mean,acc_std,f1_mean,f1_std
+lenet5_relu_adamw,0.9688,0.0183,0.9438,0.0147,0.7951,0.0385
