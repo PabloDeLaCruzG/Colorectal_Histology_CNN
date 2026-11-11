@@ -155,13 +155,70 @@ Sin embargo, el gradiente sí fue suficiente para orientar los pesos en la direc
 
 ## 5. Experimentación de mejoras sobre el modelo base
 
-*(Secciones a completar sistemáticamente en los próximos experimentos)*
+### 5.1 Experimento 1 (Arquitectura y activaciones): LeNet-5 con ReLU
+Para aislar rigurosamente el impacto de la función de activación, se mantiene intacta la topología de LeNet-5 (61.326 parámetros), el optimizador (SGD lr=0.01), el número de épocas (25), la resolución (32×32) y las particiones (10-CV con SEED=42), sustituyendo exclusivamente las 4 funciones Sigmoid por activaciones **ReLU** (f(x) = max(0, x)).
 
-* **5.1 Experimento 1 (Arquitectura y activaciones):** LeNet-5 con activaciones ReLU (f(x) = max(0, x)) para mitigar el desvanecimiento del gradiente.
-* **5.2 Experimento 2 (Optimizadores):** Comparación sistemática de SGD vs. Adam y AdamW (momentos de primer y segundo orden y desacoplamiento de decaimiento de pesos).
-* **5.3 Experimento 3 (Resolución de entrada y CNN moderna):** Escalado de 32×32 a resolución nativa 150×150 con incorporación de Batch Normalization y Dropout.
-* **5.4 Experimento 4 (Aumento de datos con fundamentación biológica):** Invarianza rotacional y reflexiva en biopsias microscópicas (`RandomHorizontalFlip`, `RandomVerticalFlip`, rotaciones ortogonales de 90°).
-* **5.5 Contraste estadístico formal:** Test de Wilcoxon y corrección de Holm-Bonferroni frente al Baseline.
+#### Hipótesis arquitectónica
+En la red original, la función sigmoide comprime las salidas en el rango (0, 1), teniendo una derivada máxima de apenas 0,25 en z=0 que decae rápidamente hacia 0. Al encadenar 5 capas, el gradiente que alcanza a la primera convolución se reduce en un factor aproximado de 0,25⁴ ≈ 0,0039, provocando una severa inanición de gradiente (*gradient starvation*) con SGD básico. Al emplear ReLU, la derivada es constante e igual a 1,0 para cualquier activación positiva, permitiendo que el gradiente fluya sin atenuación hacia las capas convolucionales tempranas para aprender detectores de bordes y texturas tisulares discriminativas.
+
+#### Resultados medidos en 10-CV (LeNet-5 ReLU)
+La evaluación en Apple Silicon (MPS) sobre los 10 pliegues produjo los siguientes resultados:
+
+| Pliegue | Muestras Train | Muestras Test | ROC-AUC | Accuracy | F1-Score (TUMOR) |
+|---|---|---|---|---|---|
+| Fold 0 | 4.500 | 500 | 0,9450 | 0,8540 | 0,6054 |
+| Fold 1 | 4.500 | 500 | 0,9376 | 0,8620 | 0,6188 |
+| Fold 2 | 4.500 | 500 | 0,9334 | 0,8280 | 0,5784 |
+| Fold 3 | 4.500 | 500 | 0,9470 | 0,8600 | 0,6354 |
+| Fold 4 | 4.500 | 500 | 0,9408 | 0,8760 | 0,6517 |
+| Fold 5 | 4.500 | 500 | 0,9421 | 0,8460 | 0,6010 |
+| Fold 6 | 4.500 | 500 | 0,9270 | 0,8440 | 0,5806 |
+| Fold 7 | 4.500 | 500 | 0,9357 | 0,8460 | 0,5926 |
+| Fold 8 | 4.500 | 500 | 0,9368 | 0,8100 | 0,5662 |
+| Fold 9 | 4.500 | 500 | 0,9035 | 0,8040 | 0,5149 |
+| **Media ± Std** | — | — | **0,9349 ± 0,0125** | **0,8430 ± 0,0229** | **0,5945 ± 0,0384** |
+
+#### Comparativa directa frente al Baseline
+
+| Modelo | Activación | ROC-AUC (Media ± Std) | Accuracy (Media ± Std) | F1-Score (Media ± Std) |
+|---|---|---|---|---|
+| `baseline_lenet5` | Sigmoid | 0,8218 ± 0,0291 | 0,8750 ± 0,0011 | 0,0000 ± 0,0000 |
+| `lenet5_relu` | ReLU | **0,9349 ± 0,0125** | 0,8430 ± 0,0229 | **0,5945 ± 0,0384** |
+
+#### Contraste estadístico de hipótesis (Test de Wilcoxon)
+Para verificar si la mejora observada en ROC-AUC (+0,1131 de media) es estadísticamente significativa y no producto de la variabilidad entre particiones, se ejecutó la prueba no paramétrica de rangos con signo de Wilcoxon sobre los 10 pares de pliegues emparejados:
+* **Pliegues ganados:** `lenet5_relu` supera a `baseline_lenet5` en **10 de los 10 pliegues** (100 % de victorias).
+* **Diferencia de medianas:** **+0,1078** en ROC-AUC a favor de ReLU.
+* **p-valor:** **0,00195** (el mínimo teórico posible con N = 10 pares: 2 / 2^10 = 2 / 1024 = 0,001953).
+* **Conclusión estadística:** Dado que p = 0,00195 < 0,05, la superioridad de LeNet-5 con ReLU sobre el baseline con Sigmoid es **estadísticamente significativa** con un nivel de confianza del 99,8 %.
+
+#### Análisis de la matriz de confusión y la aparente paradoja del Accuracy
+Al analizar las 5.000 predicciones Out-Of-Fold (OOF) se resuelve la aparente paradoja de por qué el Accuracy disminuye ligeramente (de 87,50 % a 84,30 %) mientras el ROC-AUC y el F1 experimentan un salto masivo:
+
+* **Matriz de confusión global de LeNet-5 ReLU (5.000 muestras OOF):**
+  * Verdaderos Negativos (NO TUMOR detectado): 3.643 de 4.375
+  * Falsos Positivos (Falsa alarma en tejido sano): 732 de 4.375
+  * Falsos Negativos (Tumor no detectado): 53 de 625
+  * Verdaderos Positivos (Tumor detectado correctamente): **572 de 625**
+
+* **Interpretación clínica y matemática:**
+  1. **Sensibilidad (Recall) médica:** El baseline no detectaba ni un solo tumor (0 de 625, sensibilidad = 0,0 %). En contraste, LeNet-5 con ReLU detecta con éxito **572 de los 625 casos de cáncer** (sensibilidad del **91,52 %**).
+  2. **Origen de la caída de Accuracy:** Para cazar el 91,52 % de los tumores en un entorno desbalanceado (1:7) con pérdida ponderada, el clasificador asume un umbral de sospecha que genera 732 falsos positivos en tejidos benignos dudosos. Estos 732 falsos positivos sumados a los 53 falsos negativos representan 785 fallos sobre 5.000 (Accuracy = 4.215 / 5.000 = 84,30 %).
+  3. **Significado del ROC-AUC (0,9349):** La métrica ROC-AUC refleja que si se toma una imagen al azar con TUMOR y otra imagen al azar de tejido SANO, en el **93,49 % de las ocasiones el modelo asigna una probabilidad de tumor más alta a la imagen enferma que a la sana**. Demuestra una capacidad intrínseca sobresaliente de ordenación diagnóstica, inmune al sesgo del umbral fijo de 0,5.
+
+---
+
+### 5.2 Experimento 2 (Optimizadores): Comparación sistemática de SGD vs. Adam / AdamW
+*(Próximo paso: evaluación de momentos adaptativos y decaimiento de pesos)*
+
+### 5.3 Experimento 3 (Resolución de entrada y CNN moderna): Escalado a 150×150 con BatchNorm y Dropout
+*(Planificado)*
+
+### 5.4 Experimento 4 (Aumento de datos con fundamentación biológica)
+*(Planificado)*
+
+### 5.5 Contraste estadístico global consolidado
+*(Planificado al cierre del Nivel Básico)*
 
 ---
 

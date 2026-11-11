@@ -183,8 +183,7 @@ class LeNet5(nn.Module):
 # -------------------------------------------------------------
 # MEJORA 1: LeNet-5 con activaciones ReLU
 # -------------------------------------------------------------
-# Misma arquitectura y parametros (61.326 pesos), pero sustituyendo
-# las sigmoides por ReLU para resolver el desvanecimiento del gradiente.
+# Misma arquitectura y parametros (61.326 pesos), pero sustituyendo las sigmoides por ReLU para resolver el desvanecimiento del gradiente
 class LeNet5ReLU(nn.Module):
     def __init__(self, in_channels: int = 3, num_classes: int = 2):
         super().__init__()
