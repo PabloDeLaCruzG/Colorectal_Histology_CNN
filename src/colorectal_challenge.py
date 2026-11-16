@@ -213,6 +213,71 @@ class LeNet5ReLU(nn.Module):
         return x
 
 
+# -------------------------------------------------------------
+# MEJORA 2 / EXPERIMENTO 3: CNN Moderna para resolucion 150x150
+# Basada en principios de vision medica (Balaji et al., 2022 / arXiv:2208.13264)
+# -------------------------------------------------------------
+class ModernColorectalCNN(nn.Module):
+    """
+    CNN moderna adaptada a resolucion nativa 150x150 para histologia colorrectal.
+    
+    Caracteristicas arquitectonicas clave (Balaji et al., 2022):
+    1. Resolucion completa 150x150: preserva morfologia glandular y celular sin destruccion de detalle.
+    2. 3 Bloques Convolucionales con Batch Normalization: aceleran la convergencia y estabilizan activaciones.
+    3. bias=False en convoluciones seguidas de BatchNorm: la media de BN cancela el sesgo, ahorrando parametros.
+    4. Global Average Pooling (GAP): resume cada canal a un unico valor promedio, evitando la explosion 
+       de 2.2 millones de pesos del Flatten clasico de LeNet-5.
+    5. Dropout estocastico al 20% (p=0.2): regularizacion suave que previene la co-adaptacion de neuronas
+       sin interferir con el efecto regularizador intrinseco de Batch Normalization.
+    
+    Total de parametros: ~26.000 (menos de la mitad que LeNet-5, pero operando sobre la imagen completa).
+    """
+    def __init__(self, in_channels: int = 3, num_classes: int = 2):
+        super().__init__()
+        # Bloque 1: (3, 150, 150) -> conv (16, 150, 150) -> pool (16, 75, 75)
+        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=16, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Bloque 2: (16, 75, 75) -> conv (32, 75, 75) -> pool (32, 37, 37)
+        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Bloque 3: (32, 37, 37) -> conv (64, 37, 37) -> pool (64, 18, 18)
+        self.conv3 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.relu = nn.ReLU()
+
+        # Global Average Pooling: convierte cualquier tamano espacial (18, 18) en (1, 1)
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Capas densas de clasificacion con Dropout 0.2
+        self.fc1 = nn.Linear(64, 32)
+        self.dropout = nn.Dropout(p=0.2)  # Tasa 0.2 segun literatura medica (Balaji et al., 2022)
+        self.fc2 = nn.Linear(32, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Bloque 1: Conv -> BN -> ReLU -> Pool
+        x = self.pool1(self.relu(self.bn1(self.conv1(x))))
+        # Bloque 2: Conv -> BN -> ReLU -> Pool
+        x = self.pool2(self.relu(self.bn2(self.conv2(x))))
+        # Bloque 3: Conv -> BN -> ReLU -> Pool
+        x = self.pool3(self.relu(self.bn3(self.conv3(x))))
+
+        # Reduccion espacial con Global Average Pooling: (N, 64, 18, 18) -> (N, 64, 1, 1)
+        x = self.gap(x)
+        x = torch.flatten(x, start_dim=1)  # (N, 64)
+
+        # Cabeza densa
+        x = self.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)  # Logits finales
+        return x
+
+
 # ---------------------------------------------------------------------------
 # 3. ENVOLTORIO UNIFICADO Y CONFIGURABLE (Patron Estrategia)
 # ---------------------------------------------------------------------------
@@ -345,6 +410,10 @@ def LeNet5ReLUAdamClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, devi
 def LeNet5ReLUAdamWClassifier(lr=0.001, weight_decay=1e-4, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
     """Experimento 2B: LeNet-5 con ReLU y AdamW (lr=0.001, weight_decay=1e-4)"""
     return HistologyClassifier(model_cls=LeNet5ReLU, optimizer_name="adamw", lr=lr, weight_decay=weight_decay, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
+
+def ModernCNNClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
+    """Experimento 3: CNN moderna a 150x150 con BatchNorm, GAP y Dropout=0.2 (Adam, lr=0.001)"""
+    return HistologyClassifier(model_cls=ModernColorectalCNN, optimizer_name="adam", lr=lr, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
 
 
 
@@ -596,8 +665,34 @@ def main():
         adamw_oof_df.to_csv(adamw_oof_file, index=False)
         summarize_results(adamw_metrics_df).to_csv(adamw_summary_file)
 
-    # 7. TABLA COMPARATIVA CONSOLIDADA (10-CV)
-    all_metrics = pd.concat([baseline_metrics_df, relu_metrics_df, adam_metrics_df, adamw_metrics_df], ignore_index=True)
+    # 7. EXPERIMENTO 3: CNN Moderna a 150x150 con BatchNorm, GAP y Dropout=0.2 (Balaji et al., 2022)
+    modern_cv_file = RESULTS_DIR / "modern_cnn_150_cv_results.csv"
+    modern_oof_file = RESULTS_DIR / "modern_cnn_150_oof.csv"
+    modern_summary_file = RESULTS_DIR / "modern_cnn_150_summary.csv"
+
+    if modern_cv_file.exists() and modern_oof_file.exists():
+        print("\nCargando resultados previos de Modern CNN (150x150, Adam) desde disco...")
+        modern_metrics_df = pd.read_csv(modern_cv_file)
+        modern_oof_df = pd.read_csv(modern_oof_file)
+    else:
+        def create_modern_cnn():
+            return ModernCNNClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+
+        # Importante: para la CNN moderna se pasa images_raw (resolucion nativa 150x150 completa)
+        modern_metrics_df, modern_oof_df = evaluate_cv(
+            model_name="modern_cnn_150",
+            model_factory=create_modern_cnn,
+            images=images_raw,
+            labels=labels_bin,
+            splits=splits,
+            return_oof=True,
+        )
+        modern_metrics_df.to_csv(modern_cv_file, index=False)
+        modern_oof_df.to_csv(modern_oof_file, index=False)
+        summarize_results(modern_metrics_df).to_csv(modern_summary_file)
+
+    # 8. TABLA COMPARATIVA CONSOLIDADA (10-CV)
+    all_metrics = pd.concat([baseline_metrics_df, relu_metrics_df, adam_metrics_df, adamw_metrics_df, modern_metrics_df], ignore_index=True)
     summary_all = summarize_results(all_metrics)
 
     print("\n" + "=" * 65)
@@ -605,7 +700,7 @@ def main():
     print(summary_all.to_string())
     print("=" * 65)
 
-    # 8. CONTRASTES ESTADISTICOS DE WILCOXON (N=10 pliegues)
+    # 9. CONTRASTES ESTADISTICOS DE WILCOXON (N=10 pliegues)
     print("\n" + "=" * 65)
     print("TEST DE RANGOS CON SIGNO DE WILCOXON (Metrica: ROC-AUC, N=10)")
     print("=" * 65)
@@ -614,7 +709,8 @@ def main():
         ("lenet5_relu", "baseline_lenet5", "Mejora 1 (ReLU) vs. Baseline (Sigmoid)"),
         ("lenet5_relu_adam", "lenet5_relu", "Exp 2A (Adam) vs. Mejora 1 (SGD)"),
         ("lenet5_relu_adamw", "lenet5_relu_adam", "Exp 2B (AdamW) vs. Exp 2A (Adam)"),
-        ("lenet5_relu_adamw", "baseline_lenet5", "Exp 2B (AdamW) vs. Baseline (Sigmoid)"),
+        ("modern_cnn_150", "lenet5_relu_adam", "Exp 3 (Modern CNN 150x150) vs. Exp 2A (LeNet-5 Adam 32x32)"),
+        ("modern_cnn_150", "baseline_lenet5", "Exp 3 (Modern CNN 150x150) vs. Baseline (Sigmoid 32x32)"),
     ]
 
     for mod_a, mod_b, desc in comparisons:
@@ -627,7 +723,12 @@ def main():
     print("\n" + "=" * 65)
     print("MATRICES DE CONFUSION GLOBALES OOF (5.000 instancias por modelo):")
     print("=" * 65)
-    for name, df_oof in [("LeNet-5 ReLU (SGD)", relu_oof_df), ("LeNet-5 ReLU (Adam)", adam_oof_df), ("LeNet-5 ReLU (AdamW)", adamw_oof_df)]:
+    for name, df_oof in [
+        ("LeNet-5 ReLU (SGD)", relu_oof_df),
+        ("LeNet-5 ReLU (Adam)", adam_oof_df),
+        ("LeNet-5 ReLU (AdamW)", adamw_oof_df),
+        ("Modern CNN 150x150 (Adam, Dropout 0.2)", modern_oof_df),
+    ]:
         cm = metrics.confusion_matrix(df_oof["y_true"], df_oof["y_pred"])
         print(f"\n{name}:")
         print("                     Pred: NO TUMOR (0)    Pred: TUMOR (1)")
