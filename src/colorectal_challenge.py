@@ -125,6 +125,36 @@ class ColorectalDataset(Dataset):
         return img_tensor, torch.tensor(label, dtype=torch.long)
 
 
+# -------------------------------------------------------------
+# AUMENTO DE DATOS BIOLOGICO (Grupo diedrico D4: 8 simetrias)
+# -------------------------------------------------------------
+class RandomDiscreteRotation:
+    """Rotacion ortogonal aleatoria (0, 90, 180 o 270 grados) exacta sin interpolacion ni bordes negros."""
+    def __init__(self, angles=(0, 90, 180, 270)):
+        self.angles = angles
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        angle = int(np.random.choice(self.angles))
+        return img.rotate(angle)
+
+
+def get_histology_train_transform() -> transforms.Compose:
+    """
+    Pipeline de aumento de datos con fundamentacion biologica e histopatologica:
+    Aprovecha la isotropia 2D del portaobjetos (grupo diedrico D4 de 8 simetrias):
+    - Volteo horizontal aleatorio (p=0.5)
+    - Volteo vertical aleatorio (p=0.5)
+    - Rotaciones ortogonales discretas (0, 90, 180, 270 grados)
+    No introduce distorsiones elasticas ni alteraciones cromaticas agresivas para no falsear atipias.
+    """
+    return transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        RandomDiscreteRotation(),
+        transforms.ToTensor(),
+    ])
+
+
 # ---------------------------------------------------------------------------
 # 3. BASELINE: ARQUITECTURA LeNet-5
 # ---------------------------------------------------------------------------
@@ -301,6 +331,7 @@ class HistologyClassifier:
         batch_size: int = 32,
         seed: int = SEED,
         device: torch.device = DEVICE,
+        train_transform: Optional[Callable] = None,
     ):
         self.model_cls = model_cls
         self.optimizer_name = optimizer_name.lower()
@@ -310,6 +341,7 @@ class HistologyClassifier:
         self.batch_size = batch_size
         self.seed = seed
         self.device = device
+        self.train_transform = train_transform
         self.model: Optional[nn.Module] = None
 
     # Entrena el modelo en el conjunto de entrenamiento de UN pliegue
@@ -341,7 +373,8 @@ class HistologyClassifier:
             raise ValueError(f"Optimizador no soportado: {self.optimizer_name}")
 
         # 4. DataLoader para procesar lote a lote sin saturar la memoria GPU/MPS
-        train_dataset = ColorectalDataset(train_images, train_labels, transform=None)
+        # Si se especifica train_transform (ej. Data Augmentation), se aplica solo en entrenamiento
+        train_dataset = ColorectalDataset(train_images, train_labels, transform=self.train_transform)
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.batch_size,
@@ -414,6 +447,19 @@ def LeNet5ReLUAdamWClassifier(lr=0.001, weight_decay=1e-4, epochs=25, batch_size
 def ModernCNNClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
     """Experimento 3: CNN moderna a 150x150 con BatchNorm, GAP y Dropout=0.2 (Adam, lr=0.001)"""
     return HistologyClassifier(model_cls=ModernColorectalCNN, optimizer_name="adam", lr=lr, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
+
+def ModernCNNAugClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
+    """Experimento 4: CNN moderna a 150x150 con Data Augmentation biologico (D4) y Adam (lr=0.001)"""
+    return HistologyClassifier(
+        model_cls=ModernColorectalCNN,
+        optimizer_name="adam",
+        lr=lr,
+        epochs=epochs,
+        batch_size=batch_size,
+        seed=seed,
+        device=device,
+        train_transform=get_histology_train_transform(),
+    )
 
 
 
@@ -691,8 +737,33 @@ def main():
         modern_oof_df.to_csv(modern_oof_file, index=False)
         summarize_results(modern_metrics_df).to_csv(modern_summary_file)
 
-    # 8. TABLA COMPARATIVA CONSOLIDADA (10-CV)
-    all_metrics = pd.concat([baseline_metrics_df, relu_metrics_df, adam_metrics_df, adamw_metrics_df, modern_metrics_df], ignore_index=True)
+    # 8. EXPERIMENTO 4: CNN Moderna a 150x150 con Data Augmentation Biologico (Grupo D4: Flips + Rotaciones)
+    aug_cv_file = RESULTS_DIR / "modern_cnn_150_aug_cv_results.csv"
+    aug_oof_file = RESULTS_DIR / "modern_cnn_150_aug_oof.csv"
+    aug_summary_file = RESULTS_DIR / "modern_cnn_150_aug_summary.csv"
+
+    if aug_cv_file.exists() and aug_oof_file.exists():
+        print("\nCargando resultados previos de Modern CNN con Augmentation desde disco...")
+        aug_metrics_df = pd.read_csv(aug_cv_file)
+        aug_oof_df = pd.read_csv(aug_oof_file)
+    else:
+        def create_modern_cnn_aug():
+            return ModernCNNAugClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+
+        aug_metrics_df, aug_oof_df = evaluate_cv(
+            model_name="modern_cnn_150_aug",
+            model_factory=create_modern_cnn_aug,
+            images=images_raw,
+            labels=labels_bin,
+            splits=splits,
+            return_oof=True,
+        )
+        aug_metrics_df.to_csv(aug_cv_file, index=False)
+        aug_oof_df.to_csv(aug_oof_file, index=False)
+        summarize_results(aug_metrics_df).to_csv(aug_summary_file)
+
+    # 9. TABLA COMPARATIVA CONSOLIDADA (10-CV)
+    all_metrics = pd.concat([baseline_metrics_df, relu_metrics_df, adam_metrics_df, adamw_metrics_df, modern_metrics_df, aug_metrics_df], ignore_index=True)
     summary_all = summarize_results(all_metrics)
 
     print("\n" + "=" * 65)
@@ -700,7 +771,7 @@ def main():
     print(summary_all.to_string())
     print("=" * 65)
 
-    # 9. CONTRASTES ESTADISTICOS DE WILCOXON (N=10 pliegues)
+    # 10. CONTRASTES ESTADISTICOS DE WILCOXON (N=10 pliegues)
     print("\n" + "=" * 65)
     print("TEST DE RANGOS CON SIGNO DE WILCOXON (Metrica: ROC-AUC, N=10)")
     print("=" * 65)
@@ -711,6 +782,8 @@ def main():
         ("lenet5_relu_adamw", "lenet5_relu_adam", "Exp 2B (AdamW) vs. Exp 2A (Adam)"),
         ("modern_cnn_150", "lenet5_relu_adam", "Exp 3 (Modern CNN 150x150) vs. Exp 2A (LeNet-5 Adam 32x32)"),
         ("modern_cnn_150", "baseline_lenet5", "Exp 3 (Modern CNN 150x150) vs. Baseline (Sigmoid 32x32)"),
+        ("modern_cnn_150_aug", "modern_cnn_150", "Exp 4 (Modern CNN + Augmentation) vs. Exp 3 (Modern CNN sin Aug)"),
+        ("modern_cnn_150_aug", "baseline_lenet5", "Exp 4 (Modern CNN + Augmentation) vs. Baseline (Sigmoid 32x32)"),
     ]
 
     for mod_a, mod_b, desc in comparisons:
@@ -728,6 +801,7 @@ def main():
         ("LeNet-5 ReLU (Adam)", adam_oof_df),
         ("LeNet-5 ReLU (AdamW)", adamw_oof_df),
         ("Modern CNN 150x150 (Adam, Dropout 0.2)", modern_oof_df),
+        ("Modern CNN 150x150 + Augmentation (D4)", aug_oof_df),
     ]:
         cm = metrics.confusion_matrix(df_oof["y_true"], df_oof["y_pred"])
         print(f"\n{name}:")

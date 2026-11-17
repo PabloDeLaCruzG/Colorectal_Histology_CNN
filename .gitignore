@@ -31,4 +31,5 @@ Memoria_*.md
 # Archivos de referencia y pruebas locales no requeridos en la entrega
 Colorectal_histology_LeNet5_notebook.ipynb
 lenet5.py
+scratch/
 
