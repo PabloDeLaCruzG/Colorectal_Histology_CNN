@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torchvision import models, transforms
 
 # ---------------------------------------------------------------------------
 # 1. CONFIGURACION, DATOS Y PREPROCESADO
@@ -115,6 +115,14 @@ def get_clahe_lab_transform(clip_limit: float = 2.0, tile_grid_size: tuple[int, 
     return transforms.Compose([ClaheLabTransform(clip_limit, tile_grid_size), transforms.ToTensor()])
 
 
+def get_imagenet_norm_transform() -> transforms.Compose:
+    """Normalizacion estandar de ImageNet (constantes fijas, cero fuga de datos)."""
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
 # ---------------------------------------------------------------------------
 # 2. ARQUITECTURAS CNN EN PYTORCH
 # Nota para lectura desde Keras: __init__ declara las capas y forward() define
@@ -180,6 +188,22 @@ class ModernColorectalCNN(nn.Module):
         return self.fc2(x)
 
 
+def build_resnet18_transfer(num_classes: int = 8, fine_tune: bool = False) -> nn.Module:
+    """
+    Transfer Learning con ResNet18 preentrenada en ImageNet (11.18M parametros totales):
+    - fine_tune=False (Feature Extraction): congela el backbone y entrena solo fc (4.104 pesos).
+    - fine_tune=True (Fine-Tuning): descongela tambien el ultimo bloque layer4 (8.397.832 pesos).
+    """
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    for param in model.parameters():
+        param.requires_grad = False
+    if fine_tune:
+        for param in model.layer4.parameters():
+            param.requires_grad = True
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    return model
+
+
 # ---------------------------------------------------------------------------
 # 3. ENTRENADOR UNIFICADO (EQUIVALENTE A model.fit / model.predict DE KERAS)
 # ---------------------------------------------------------------------------
@@ -234,7 +258,9 @@ class HistologyClassifier:
         opt_map = {"sgd": torch.optim.SGD, "adam": torch.optim.Adam, "adamw": torch.optim.AdamW}
         if self.optimizer_name not in opt_map:
             raise ValueError(f"Optimizador no soportado: {self.optimizer_name}")
-        optimizer = opt_map[self.optimizer_name](self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        # Solo optimizamos parametros descongelados (imprescindible en Feature Extraction / Fine-Tuning)
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer = opt_map[self.optimizer_name](trainable_params, lr=self.lr, weight_decay=self.weight_decay)
 
         scheduler = None
         if self.scheduler_name == "cosine":
@@ -568,6 +594,59 @@ def run_medium_level(images_raw: np.ndarray, splits: list[dict]) -> None:
     print("\nINFORME POR CLASE OOF — Campeon Multiclase (mc_modern_cnn_150_cosine):")
     print(metrics.classification_report(cosine_oof["y_true"], cosine_oof["y_pred"], target_names=CLASS_NAMES, digits=4, zero_division=0))
     run_error_and_gradcam_analysis(images_raw, labels_mc, splits, cosine_oof)
+    return results_map["mc_modern_cnn_150_cosine"][0]
+
+
+def run_advanced_level(images_raw: np.ndarray, splits: list[dict], mc_champion_metrics: pd.DataFrame) -> None:
+    """
+    Nivel Avanzado: Transfer Learning con ResNet18 en 8 clases comparando
+    Feature Extraction (fc) frente a Fine-Tuning parcial (layer4 + fc).
+    """
+    _, labels_mc, _ = load_dataset(multiclass=True)
+    imgnet_tf = get_imagenet_norm_transform()
+
+    adv_configs = [
+        (
+            "mc_resnet18_fe",
+            lambda: HistologyClassifier(
+                lambda: build_resnet18_transfer(num_classes=8, fine_tune=False),
+                num_classes=8, optimizer_name="adam", lr=1e-3, epochs=20,
+                scheduler_name="cosine", eta_min=1e-5,
+                train_transform=imgnet_tf, eval_transform=imgnet_tf,
+            ),
+        ),
+        (
+            "mc_resnet18_ft",
+            lambda: HistologyClassifier(
+                lambda: build_resnet18_transfer(num_classes=8, fine_tune=True),
+                num_classes=8, optimizer_name="adam", lr=1e-4, epochs=20,
+                scheduler_name="cosine", eta_min=1e-6,
+                train_transform=imgnet_tf, eval_transform=imgnet_tf,
+            ),
+        ),
+    ]
+
+    adv_results = {name: run_or_load_cv(name, factory, images_raw, labels_mc, splits) for name, factory in adv_configs}
+    all_mc = pd.concat([mc_champion_metrics] + [m for m, _ in adv_results.values()], ignore_index=True)
+
+    print("\n" + "=" * 65 + "\nNIVEL AVANZADO — TRANSFER LEARNING (ResNet18) vs CNN DESDE CERO:\n" + summarize_results(all_mc).to_string())
+    adv_pairs = [
+        ("mc_resnet18_ft", "mc_resnet18_fe", "Fine-Tuning (layer4+fc) vs Feature Extraction (fc)"),
+        ("mc_resnet18_ft", "mc_modern_cnn_150_cosine", "ResNet18 Fine-Tuning vs ModernCNN Cosine (26k)"),
+        ("mc_resnet18_fe", "mc_modern_cnn_150_cosine", "ResNet18 Feature Extraction vs ModernCNN Cosine (26k)"),
+    ]
+    print("\nTEST DE WILCOXON NIVEL AVANZADO CON AJUSTE HOLM-BONFERRONI (N=10):")
+    for metric_name in ["roc_auc", "accuracy", "f1"]:
+        raw = [wilcoxon_compare(all_mc, a, b, metric_name) for a, b, _ in adv_pairs]
+        adj = holm_bonferroni_adjust([r["p_value"] for r in raw])
+        print(f"  Metrica {metric_name.upper()}:")
+        for (_, _, desc), w, p_h in zip(adv_pairs, raw, adj):
+            print(f"    * {desc}: wins={w['wins']}/10 | dif_med={w['median_diff']:+.4f} | p={w['p_value']:.5f} | p_holm={p_h:.5f}")
+
+    for name in ["mc_resnet18_fe", "mc_resnet18_ft"]:
+        oof_df = adv_results[name][1]
+        print(f"\nINFORME POR CLASE OOF — {name}:")
+        print(metrics.classification_report(oof_df["y_true"], oof_df["y_pred"], target_names=CLASS_NAMES, digits=4, zero_division=0))
 
 
 def main() -> None:
@@ -575,7 +654,8 @@ def main() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     images_raw, _, splits = load_dataset(multiclass=False)
     run_basic_level(images_raw, splits)
-    run_medium_level(images_raw, splits)
+    mc_champion_metrics = run_medium_level(images_raw, splits)
+    run_advanced_level(images_raw, splits, mc_champion_metrics)
 
 
 if __name__ == "__main__":
