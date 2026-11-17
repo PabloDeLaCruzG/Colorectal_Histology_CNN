@@ -1,0 +1,2 @@
+model,roc_auc_mean,roc_auc_std,acc_mean,acc_std,f1_mean,f1_std
+mc_modern_cnn_150_clahe,0.9855,0.0148,0.8088,0.114,0.8,0.131

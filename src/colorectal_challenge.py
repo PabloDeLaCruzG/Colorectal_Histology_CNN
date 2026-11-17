@@ -1,21 +1,18 @@
 """
-Desafio de Histologia Colorrectal (CNN en PyTorch)
-===================================================
+Desafio de Histologia Colorrectal (Nivel Basico y Medio en PyTorch)
+===================================================================
 
-Contenido del Nivel Basico:
-1. Carga y gestion eficiente de memoria del dataset (Zenodo 53169, 5.000 teselas).
-2. Particiones fijas de validacion cruzada estratificada de 10 pliegues (10-CV).
-3. Baseline LeNet-5 (LeCun 1998 / Keras notebook del profesor):
-   - Resolucion 32x32
-   - Activaciones Sigmoid
-   - Optimizador SGD (lr=0.01)
-   - Compensacion del desbalance 1:7 mediante perdida ponderada (class weights)
-   - Evaluacion rigurosa en ROC-AUC continua (sin redondeo artificial)
-4. Metricas y evaluacion Out-Of-Fold (OOF).
+Indice rapido del script (pensado para lectura directa):
+  1. Configuracion, datos en uint8 y transformaciones (D4 y Lab-CLAHE)
+  2. Arquitecturas CNN (LeNet5 y ModernColorectalCNN)
+  3. Entrenador unificado (HistologyClassifier: optimizadores y CosineAnnealingLR)
+  4. Validacion cruzada 10-CV, metricas y contrastes de Wilcoxon + Holm-Bonferroni
+  5. Analisis de errores OOF y explicabilidad Grad-CAM (hooks en relu3)
+  6. Ejecucion principal (Nivel Basico binario + Nivel Medio 8 clases)
 """
 
 from pathlib import Path
-from typing import Callable, Optional, Type
+from typing import Callable, Optional
 import json
 import time
 
@@ -24,129 +21,72 @@ import pandas as pd
 from PIL import Image
 from scipy.stats import wilcoxon
 from sklearn import metrics
-from sklearn.model_selection import StratifiedKFold
 from sklearn.utils import class_weight
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 # ---------------------------------------------------------------------------
-# 1. CONSTANTES Y CONFIGURACION DEL ENTORNO
+# 1. CONFIGURACION, DATOS Y PREPROCESADO
 # ---------------------------------------------------------------------------
 SEED = 42
-N_SPLITS = 10
+CLASS_NAMES = ["TUMOR", "STROMA", "COMPLEX", "LYMPHO", "DEBRIS", "MUCOSA", "ADIPOSE", "EMPTY"]
 
-# Rutas del proyecto relativas al script
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 RESULTS_DIR = BASE_DIR / "results"
+GRADCAM_DIR = RESULTS_DIR / "gradcam"
 
-# Seleccion de dispositivo jerarquica: Apple Silicon (MPS) -> NVIDIA (CUDA) -> CPU
-if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-elif torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-else:
-    DEVICE = torch.device("cpu")
+# Seleccion automatica de aceleracion: Apple Silicon (MPS) -> NVIDIA (CUDA) -> CPU
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ---------------------------------------------------------------------------
-# 2. CARGA DE DATOS Y GESTION DE MEMORIA
-# ---------------------------------------------------------------------------
-
-# Carga las imagenes y etiquetas preprocesadas en uint8 y las particiones 10-CV
-def load_dataset() -> tuple[np.ndarray, np.ndarray, list[dict]]:
-    """
-    Gestion de memoria:
-    - Las imagenes originales (5.000 x 150 x 150 x 3) se almacenan en uint8 (~322 MB).
-    - Esto evita saturar los 8 GB de RAM del MacBook M2, ya que en float32 ocuparian
-      1,35 GB solo en memoria cruda sin contar tensores intermedios ni gradientes.
-    
-    Returns:
-        images: Array numpy uint8 con las 5.000 teselas.
-        labels: Array numpy int64 (1: TUMOR, 0: NO TUMOR).
-        splits: Lista con los 10 pliegues estratificados.
-    """
-    img_path = DATA_DIR / "images_150x150.npy"
-    lbl_path = DATA_DIR / "labels_binary.npy"
-    splits_path = DATA_DIR / "splits_10cv.json"
-
-    if not img_path.exists() or not lbl_path.exists() or not splits_path.exists():
-        raise FileNotFoundError(
-            "No se encontraron los datos procesados en data/. "
-            "Asegurate de que existen images_150x150.npy, labels_binary.npy y splits_10cv.json."
-        )
-
-    images = np.load(img_path)
-    labels = np.load(lbl_path)
-
-    with open(splits_path, "r", encoding="utf-8") as f:
-        splits_data = json.load(f)
-
-    # Usamos la estratificacion multiclase: garantiza que en cada pliegue
-    # la proporcion de TUMOR vs NO TUMOR sea 1:7 y que los 7 tipos de tejido
-    # sano se repartan equitativamente entre los 10 pliegues.
-    splits = splits_data["splits_multiclass_stratified"]
-
+def load_dataset(multiclass: bool = False) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+    """Carga imagenes en uint8 (~322 MB en RAM), etiquetas y particiones 10-CV fijas."""
+    lbl_name = "labels_multiclass.npy" if multiclass else "labels_binary.npy"
+    images = np.load(DATA_DIR / "images_150x150.npy")
+    labels = np.load(DATA_DIR / lbl_name)
+    with open(DATA_DIR / "splits_10cv.json", "r", encoding="utf-8") as f:
+        splits = json.load(f)["splits_multiclass_stratified"]
     return images, labels, splits
 
 
-# Dataset de PyTorch para teselas histologicas
 class ColorectalDataset(Dataset):
-    """
-    Aplica transformaciones de imagen sobre la marcha por cada lote,
-    garantizando que la memoria de la GPU solo contenga un lote float32 a la vez.
-    """
+    """Dataset PyTorch: convierte cada lote a float32 [0, 1] sobre la marcha para ahorrar RAM."""
 
     def __init__(self, images: np.ndarray, labels: np.ndarray, transform: Optional[Callable] = None):
         self.images = images
         self.labels = labels
         self.transform = transform
-        self.default_to_tensor = transforms.ToTensor()
+        self.to_tensor = transforms.ToTensor()
 
     def __len__(self) -> int:
         return len(self.labels)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        img_arr = self.images[idx]  # uint8 en rango [0, 255]
-        label = int(self.labels[idx])
-
+        img_arr = self.images[idx]
         if self.transform is not None:
-            # Si hay transformacion (por ejemplo, Resize o Data Augmentation),
-            # convertimos temporalmente a PIL Image
-            img_pil = Image.fromarray(img_arr)
-            img_tensor = self.transform(img_pil)
+            img_tensor = self.transform(Image.fromarray(img_arr))
         else:
-            # Conversion estandar: uint8 [0, 255] -> float32 [0.0, 1.0] con forma (3, H, W)
-            img_tensor = self.default_to_tensor(img_arr)
-
-        return img_tensor, torch.tensor(label, dtype=torch.long)
+            img_tensor = self.to_tensor(img_arr)
+        return img_tensor, torch.tensor(int(self.labels[idx]), dtype=torch.long)
 
 
-# -------------------------------------------------------------
-# AUMENTO DE DATOS BIOLOGICO (Grupo diedrico D4: 8 simetrias)
-# -------------------------------------------------------------
 class RandomDiscreteRotation:
-    """Rotacion ortogonal aleatoria (0, 90, 180 o 270 grados) exacta sin interpolacion ni bordes negros."""
-    def __init__(self, angles=(0, 90, 180, 270)):
+    """Rotacion ortogonal aleatoria (0, 90, 180 o 270 grados) sin bordes negros."""
+
+    def __init__(self, angles: tuple[int, ...] = (0, 90, 180, 270)):
         self.angles = angles
 
     def __call__(self, img: Image.Image) -> Image.Image:
-        angle = int(np.random.choice(self.angles))
-        return img.rotate(angle)
+        return img.rotate(int(np.random.choice(self.angles)))
 
 
-def get_histology_train_transform() -> transforms.Compose:
-    """
-    Pipeline de aumento de datos con fundamentacion biologica e histopatologica:
-    Aprovecha la isotropia 2D del portaobjetos (grupo diedrico D4 de 8 simetrias):
-    - Volteo horizontal aleatorio (p=0.5)
-    - Volteo vertical aleatorio (p=0.5)
-    - Rotaciones ortogonales discretas (0, 90, 180, 270 grados)
-    No introduce distorsiones elasticas ni alteraciones cromaticas agresivas para no falsear atipias.
-    """
+def get_d4_train_transform() -> transforms.Compose:
+    """Aumento de datos biologico (grupo diedrico D4: 8 simetrias del portaobjetos)."""
     return transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
@@ -155,659 +95,487 @@ def get_histology_train_transform() -> transforms.Compose:
     ])
 
 
-# ---------------------------------------------------------------------------
-# 3. BASELINE: ARQUITECTURA LeNet-5
-# ---------------------------------------------------------------------------
+class ClaheLabTransform:
+    """Aplica CLAHE solo al canal L de CIE Lab para preservar los tonos H&E (a, b)."""
 
-# LeNet-5 original adaptada a 3 canales RGB 
+    def __init__(self, clip_limit: float = 2.0, tile_grid_size: tuple[int, int] = (8, 8)):
+        import cv2
+        self._cv2 = cv2
+        self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        lab = self._cv2.cvtColor(np.asarray(img, dtype=np.uint8), self._cv2.COLOR_RGB2LAB)
+        l_ch, a_ch, b_ch = self._cv2.split(lab)
+        lab_eq = self._cv2.merge((self.clahe.apply(l_ch), a_ch, b_ch))
+        return Image.fromarray(self._cv2.cvtColor(lab_eq, self._cv2.COLOR_LAB2RGB))
+
+
+def get_clahe_lab_transform(clip_limit: float = 2.0, tile_grid_size: tuple[int, int] = (8, 8)) -> transforms.Compose:
+    """Pipeline determinista imagen a imagen con Lab-CLAHE y paso a tensor."""
+    return transforms.Compose([ClaheLabTransform(clip_limit, tile_grid_size), transforms.ToTensor()])
+
+
+# ---------------------------------------------------------------------------
+# 2. ARQUITECTURAS CNN EN PYTORCH
+# Nota para lectura desde Keras: __init__ declara las capas y forward() define
+# el flujo de tensores. Las redes devuelven logits sin Softmax porque
+# nn.CrossEntropyLoss ya aplica LogSoftmax internamente de forma estable.
+# ---------------------------------------------------------------------------
 class LeNet5(nn.Module):
-    """
-    Estructura capa a capa:
-    1. Conv2D(in=3, out=6, kernel=5x5) -> Sigmoid -> MaxPool(2x2, stride=2)
-       Entrada: (3, 32, 32) -> Salida: (6, 14, 14)
-    2. Conv2D(in=6, out=16, kernel=5x5) -> Sigmoid -> MaxPool(2x2, stride=2)
-       Entrada: (6, 14, 14) -> Salida: (16, 5, 5)
-    3. Flatten: 16 * 5 * 5 = 400 neuronas
-    4. Densa(400 -> 120) -> Sigmoid
-    5. Densa(120 -> 84) -> Sigmoid
-    6. Densa(84 -> 2) -> Logits finales (sin softmax, se integra en CrossEntropyLoss)
-    
-    Total parametros: 61.326 pesos entrenables.
-    """
+    """LeNet-5 (32x32 -> 61.326 parametros) con activacion configurable (sigmoid o relu)."""
 
-    def __init__(self, in_channels: int = 3, num_classes: int = 2):
+    def __init__(self, in_channels: int = 3, num_classes: int = 2, activation: str = "sigmoid"):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=6, kernel_size=5)
-        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5)
+        self.conv1 = nn.Conv2d(in_channels, 6, kernel_size=5)
+        self.conv2 = nn.Conv2d(6, 16, kernel_size=5)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.sigmoid = nn.Sigmoid()
-
+        self.act = nn.ReLU() if activation == "relu" else nn.Sigmoid()
         self.fc1 = nn.Linear(16 * 5 * 5, 120)
         self.fc2 = nn.Linear(120, 84)
         self.fc3 = nn.Linear(84, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Bloque convolucional 1
-        #   1. conv1 aplica 6 filtros para buscar caracteristicas basicas
-        #   2. sigmoid activa la neurona de forma no lineal, los valores quedan entre 0 y 1
-        #   3. pool reduce el tamaño de la imagen a la mitad,quedandose con lo mas importante
-        x = self.pool(self.sigmoid(self.conv1(x)))
-        # Bloque convolucional 2
-        # Lo mismo pero con 16 filtros
-        x = self.pool(self.sigmoid(self.conv2(x)))
-
-        # Aplanado para entrar en las capas densas (1 fila de numeros)
+        x = self.pool(self.act(self.conv1(x)))
+        x = self.pool(self.act(self.conv2(x)))
         x = torch.flatten(x, start_dim=1)
-
-        # Capas densas conectadas
-        # Pasan la fila por nuuronas conectadas entre sí en las capas ocultas
-        # sigmoid mantiene las activaciones controladas
-        x = self.sigmoid(self.fc1(x)) 
-        x = self.sigmoid(self.fc2(x))
-        # Transforma los datos en la "puntuacion final"
-        # Los logits son las puntuaciones de cada clase, la mas alta es la que se decide como prediccion
-        x = self.fc3(x)  # Logits de salida
-        return x
+        x = self.act(self.fc1(x))
+        x = self.act(self.fc2(x))
+        return self.fc3(x)
 
 
-# -------------------------------------------------------------
-# MEJORA 1: LeNet-5 con activaciones ReLU
-# -------------------------------------------------------------
-# Misma arquitectura y parametros (61.326 pesos), pero sustituyendo las sigmoides por ReLU para resolver el desvanecimiento del gradiente
-class LeNet5ReLU(nn.Module):
-    def __init__(self, in_channels: int = 3, num_classes: int = 2):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=6, kernel_size=5)
-        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        # ReLU: derivada = 1 para valores > 0, el gradiente no se reduce a 0.25
-        self.relu = nn.ReLU()
-
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Bloque convolucional 1 con ReLU
-        x = self.pool(self.relu(self.conv1(x)))
-        # Bloque convolucional 2 con ReLU
-        x = self.pool(self.relu(self.conv2(x)))
-
-        # Aplanado a vector 1D
-        x = torch.flatten(x, start_dim=1)
-
-        # Capas densas con ReLU
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        x = self.fc3(x)  # Logits de salida
-        return x
-
-
-# -------------------------------------------------------------
-# MEJORA 2 / EXPERIMENTO 3: CNN Moderna para resolucion 150x150
-# Basada en principios de vision medica (Balaji et al., 2022 / arXiv:2208.13264)
-# -------------------------------------------------------------
 class ModernColorectalCNN(nn.Module):
     """
-    CNN moderna adaptada a resolucion nativa 150x150 para histologia colorrectal.
-    
-    Caracteristicas arquitectonicas clave (Balaji et al., 2022):
-    1. Resolucion completa 150x150: preserva morfologia glandular y celular sin destruccion de detalle.
-    2. 3 Bloques Convolucionales con Batch Normalization: aceleran la convergencia y estabilizan activaciones.
-    3. bias=False en convoluciones seguidas de BatchNorm: la media de BN cancela el sesgo, ahorrando parametros.
-    4. Global Average Pooling (GAP): resume cada canal a un unico valor promedio, evitando la explosion 
-       de 2.2 millones de pesos del Flatten clasico de LeNet-5.
-    5. Dropout estocastico al 20% (p=0.2): regularizacion suave que previene la co-adaptacion de neuronas
-       sin interferir con el efecto regularizador intrinseco de Batch Normalization.
-    
-    Total de parametros: ~26.000 (menos de la mitad que LeNet-5, pero operando sobre la imagen completa).
+    CNN moderna a 150x150 (Balaji et al., 2022): 3 bloques Conv-BN-ReLU-MaxPool + GAP + Dropout(0.2).
+    Total: 25.842 parametros en binario (2 clases) y 26.040 en multiclase (8 clases).
     """
+
     def __init__(self, in_channels: int = 3, num_classes: int = 2):
         super().__init__()
-        # Bloque 1: (3, 150, 150) -> conv (16, 150, 150) -> pool (16, 75, 75)
-        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=16, kernel_size=3, padding=1, bias=False)
+        # bias=False porque BatchNorm ya incorpora su propio parametro de desplazamiento (beta)
+        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(16)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool1 = nn.MaxPool2d(2, 2)
 
-        # Bloque 2: (16, 75, 75) -> conv (32, 75, 75) -> pool (32, 37, 37)
-        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(32)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool2 = nn.MaxPool2d(2, 2)
 
-        # Bloque 3: (32, 37, 37) -> conv (64, 37, 37) -> pool (64, 18, 18)
-        self.conv3 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1, bias=False)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(64)
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.relu3 = nn.ReLU()  # Capa separada para registrar hooks de Grad-CAM sobre 37x37
+        self.pool3 = nn.MaxPool2d(2, 2)
 
         self.relu = nn.ReLU()
-
-        # Global Average Pooling: convierte cualquier tamano espacial (18, 18) en (1, 1)
-        self.gap = nn.AdaptiveAvgPool2d((1, 1))
-
-        # Capas densas de clasificacion con Dropout 0.2
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))  # Global Average Pooling: evita millones de pesos
         self.fc1 = nn.Linear(64, 32)
-        self.dropout = nn.Dropout(p=0.2)  # Tasa 0.2 segun literatura medica (Balaji et al., 2022)
+        self.dropout = nn.Dropout(p=0.2)
         self.fc2 = nn.Linear(32, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Bloque 1: Conv -> BN -> ReLU -> Pool
         x = self.pool1(self.relu(self.bn1(self.conv1(x))))
-        # Bloque 2: Conv -> BN -> ReLU -> Pool
         x = self.pool2(self.relu(self.bn2(self.conv2(x))))
-        # Bloque 3: Conv -> BN -> ReLU -> Pool
-        x = self.pool3(self.relu(self.bn3(self.conv3(x))))
-
-        # Reduccion espacial con Global Average Pooling: (N, 64, 18, 18) -> (N, 64, 1, 1)
-        x = self.gap(x)
-        x = torch.flatten(x, start_dim=1)  # (N, 64)
-
-        # Cabeza densa
-        x = self.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)  # Logits finales
-        return x
+        x = self.pool3(self.relu3(self.bn3(self.conv3(x))))
+        x = torch.flatten(self.gap(x), start_dim=1)
+        x = self.dropout(self.relu(self.fc1(x)))
+        return self.fc2(x)
 
 
 # ---------------------------------------------------------------------------
-# 3. ENVOLTORIO UNIFICADO Y CONFIGURABLE (Patron Estrategia)
+# 3. ENTRENADOR UNIFICADO (EQUIVALENTE A model.fit / model.predict DE KERAS)
 # ---------------------------------------------------------------------------
 class HistologyClassifier:
-    """
-    Envoltorio unificado para entrenamiento e inferencia de CNNs histologicas.
-    
-    Aplica el patron Estrategia para evitar duplicar codigo entre experimentos:
-    permite desacoplar la arquitectura (LeNet-5 Sigmoid, LeNet-5 ReLU, etc.)
-    del optimizador (SGD, Adam, AdamW), garantizando que todos los modelos se
-    evaluan bajo exactamente el mismo protocolo de cero fuga y gestion de memoria.
-    """
+    """Envoltorio configurable para entrenar y predecir cualquier modelo bajo el mismo protocolo."""
 
     def __init__(
         self,
-        model_cls: Type[nn.Module] = LeNet5ReLU,
-        optimizer_name: str = "sgd",
-        lr: float = 0.01,
+        model_factory_fn: Callable[[], nn.Module],
+        num_classes: int = 2,
+        optimizer_name: str = "adam",
+        lr: float = 0.001,
         weight_decay: float = 0.0,
         epochs: int = 25,
         batch_size: int = 32,
+        scheduler_name: Optional[str] = None,
+        eta_min: float = 1e-5,
+        train_transform: Optional[Callable] = None,
+        eval_transform: Optional[Callable] = None,
         seed: int = SEED,
         device: torch.device = DEVICE,
-        train_transform: Optional[Callable] = None,
     ):
-        self.model_cls = model_cls
+        self.model_factory_fn = model_factory_fn
+        self.num_classes = num_classes
         self.optimizer_name = optimizer_name.lower()
         self.lr = lr
         self.weight_decay = weight_decay
         self.epochs = epochs
         self.batch_size = batch_size
+        self.scheduler_name = scheduler_name.lower() if scheduler_name else None
+        self.eta_min = eta_min
+        self.train_transform = train_transform
+        self.eval_transform = eval_transform
         self.seed = seed
         self.device = device
-        self.train_transform = train_transform
         self.model: Optional[nn.Module] = None
 
-    # Entrena el modelo en el conjunto de entrenamiento de UN pliegue
     def fit(self, train_images: np.ndarray, train_labels: np.ndarray) -> "HistologyClassifier":
+        """Entrena la red desde cero sobre un unico pliegue sin ver el conjunto de test."""
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
+        self.model = self.model_factory_fn().to(self.device)
 
-        # 1. Instanciar la red neuronal limpia para este pliegue
-        self.model = self.model_cls(in_channels=3, num_classes=2).to(self.device)
-
-        # 2. Pesos balanceados (inversos a la frecuencia) calculados solo con train
-        #    Compensa el desbalance 1:7 entre TUMOR (625) y NO TUMOR (4.375)
-        classes = np.unique(train_labels)
-        weights = class_weight.compute_class_weight(class_weight="balanced", classes=classes, y=train_labels)
-        weight_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device)
-        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
-
-        # 3. Configuracion del optimizador segun el experimento
-        if self.optimizer_name == "sgd":
-            # Descenso por Gradiente Estocastico clasico
-            optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        elif self.optimizer_name == "adam":
-            # Momentos adaptativos (media e inercia del gradiente por parametro)
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        elif self.optimizer_name == "adamw":
-            # Momentos adaptativos con decaimiento de pesos desacoplado (regularizacion limpia)
-            optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        # En binario (1:7) compensamos el desbalance con pesos calculados solo sobre train
+        if self.num_classes == 2:
+            classes = np.unique(train_labels)
+            weights = class_weight.compute_class_weight("balanced", classes=classes, y=train_labels)
+            criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32, device=self.device))
         else:
-            raise ValueError(f"Optimizador no soportado: {self.optimizer_name}")
+            criterion = nn.CrossEntropyLoss()
 
-        # 4. DataLoader para procesar lote a lote sin saturar la memoria GPU/MPS
-        # Si se especifica train_transform (ej. Data Augmentation), se aplica solo en entrenamiento
-        train_dataset = ColorectalDataset(train_images, train_labels, transform=self.train_transform)
-        train_loader = DataLoader(
-            train_dataset,
+        opt_map = {"sgd": torch.optim.SGD, "adam": torch.optim.Adam, "adamw": torch.optim.AdamW}
+        if self.optimizer_name not in opt_map:
+            raise ValueError(f"Optimizador no soportado: {self.optimizer_name}")
+        optimizer = opt_map[self.optimizer_name](self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+        scheduler = None
+        if self.scheduler_name == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=self.eta_min)
+
+        loader = DataLoader(
+            ColorectalDataset(train_images, train_labels, transform=self.train_transform),
             batch_size=self.batch_size,
             shuffle=True,
             generator=torch.Generator().manual_seed(self.seed),
         )
 
-        # 5. Bucle de entrenamiento por epocas
         self.model.train()
-        for epoch in range(1, self.epochs + 1):
-            for batch_imgs, batch_y in train_loader:
-                batch_imgs = batch_imgs.to(self.device)
-                batch_y = batch_y.to(self.device)
-
-                optimizer.zero_grad()  # limpia calculos anteriores
-                logits = self.model(batch_imgs) # Pasa las imagenes por la red (ejecutando el forward) y obtiene las puntuaciones
-                loss = criterion(logits, batch_y) # COmpara los logits con las etiqeutas reales, para calcular la perdida loss.backward()
-                loss.backward() # Calcula cuanto contribuye cada neurona al error
-                optimizer.step() # Actualiza los pesos de la red para intentar hacerlo mejor en el siguiente batch
-
+        for _ in range(self.epochs):
+            for batch_x, batch_y in loader:
+                batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                optimizer.zero_grad()          # 1. Limpiar gradientes del paso anterior
+                loss = criterion(self.model(batch_x), batch_y)  # 2. Forward + perdida
+                loss.backward()                # 3. Backpropagation
+                optimizer.step()               # 4. Actualizar pesos
+            if scheduler is not None:
+                scheduler.step()
         return self
 
     def predict_proba(self, test_images: np.ndarray) -> np.ndarray:
-        """
-        Calcula la probabilidad continua de la clase positiva (TUMOR, clase 1)
-        aplicando la funcion Softmax real, sin ningun redondeo.
-        """
-        assert self.model is not None, "El modelo debe estar entrenado antes de predecir."
+        """Devuelve probabilidades Softmax continuas: vector (N,) en binario o matriz (N, C) en multiclase."""
+        assert self.model is not None, "Entrena el modelo antes de predecir."
         self.model.eval()
-
-        test_dataset = ColorectalDataset(test_images, np.zeros(len(test_images), dtype=int), transform=None)
-        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
-
+        loader = DataLoader(
+            ColorectalDataset(test_images, np.zeros(len(test_images), dtype=int), transform=self.eval_transform),
+            batch_size=self.batch_size,
+            shuffle=False,
+        )
         probs_list = []
-        with torch.no_grad():
-            for batch_imgs, _ in test_loader:
-                batch_imgs = batch_imgs.to(self.device)
-                logits = self.model(batch_imgs)
-                # Softmax continuo: seleccionamos la columna 1 (probabilidad de TUMOR)
-                probs = torch.softmax(logits, dim=1)[:, 1]
+        with torch.no_grad():  # Desactiva calculo de gradientes en inferencia (ahorra RAM y tiempo)
+            for batch_x, _ in loader:
+                probs = torch.softmax(self.model(batch_x.to(self.device)), dim=1)
+                if self.num_classes == 2:
+                    probs = probs[:, 1]
                 probs_list.append(probs.cpu().numpy())
-
         return np.concatenate(probs_list)
 
     def predict(self, test_images: np.ndarray, threshold: float = 0.5) -> np.ndarray:
-        """
-        Prediccion discreta (0 o 1) aplicando el umbral clinico estandar (0.5).
-        """
+        """Prediccion discreta por umbral (binario) o argmax (multiclase)."""
         probs = self.predict_proba(test_images)
-        return (probs >= threshold).astype(int)
-
-
-# Fabricas de conveniencia para invocar cada configuracion experimental
-def BaselineLeNet5Classifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
-    """Modelo Base: LeNet-5 original con Sigmoid y SGD (lr=0.01)"""
-    return HistologyClassifier(model_cls=LeNet5, optimizer_name="sgd", lr=lr, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
-
-def LeNet5ReLUClassifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
-    """Mejora 1: LeNet-5 con ReLU y SGD (lr=0.01)"""
-    return HistologyClassifier(model_cls=LeNet5ReLU, optimizer_name="sgd", lr=lr, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
-
-def LeNet5ReLUAdamClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
-    """Experimento 2A: LeNet-5 con ReLU y Adam (lr=0.001)"""
-    return HistologyClassifier(model_cls=LeNet5ReLU, optimizer_name="adam", lr=lr, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
-
-def LeNet5ReLUAdamWClassifier(lr=0.001, weight_decay=1e-4, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
-    """Experimento 2B: LeNet-5 con ReLU y AdamW (lr=0.001, weight_decay=1e-4)"""
-    return HistologyClassifier(model_cls=LeNet5ReLU, optimizer_name="adamw", lr=lr, weight_decay=weight_decay, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
-
-def ModernCNNClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
-    """Experimento 3: CNN moderna a 150x150 con BatchNorm, GAP y Dropout=0.2 (Adam, lr=0.001)"""
-    return HistologyClassifier(model_cls=ModernColorectalCNN, optimizer_name="adam", lr=lr, epochs=epochs, batch_size=batch_size, seed=seed, device=device)
-
-def ModernCNNAugClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE):
-    """Experimento 4: CNN moderna a 150x150 con Data Augmentation biologico (D4) y Adam (lr=0.001)"""
-    return HistologyClassifier(
-        model_cls=ModernColorectalCNN,
-        optimizer_name="adam",
-        lr=lr,
-        epochs=epochs,
-        batch_size=batch_size,
-        seed=seed,
-        device=device,
-        train_transform=get_histology_train_transform(),
-    )
-
-
-
-
+        return (probs >= threshold).astype(int) if self.num_classes == 2 else np.argmax(probs, axis=1).astype(int)
 
 
 # ---------------------------------------------------------------------------
-# 4. ARNES DE VALIDACION CRUZADA (10-CV) Y METRICAS
+# 4. ARNES 10-CV, METRICAS Y CONTRASTES ESTADISTICOS
 # ---------------------------------------------------------------------------
-
-# Calcula las metricas requeridas: ROC-AUC continua, Accuracy y F1-Score
-def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndarray | None = None) -> dict:
-    if y_pred is None:
-        y_pred = (y_prob >= 0.5).astype(int)
-
+def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Calcula ROC-AUC (binario o macro OVR), Accuracy y F1 (binario o macro)."""
+    is_mc = y_prob.ndim == 2 and y_prob.shape[1] > 2
     try:
-        auc = float(metrics.roc_auc_score(y_true, y_prob))
+        auc = float(metrics.roc_auc_score(y_true, y_prob, multi_class="ovr", average="macro") if is_mc else metrics.roc_auc_score(y_true, y_prob))
     except ValueError:
         auc = 0.5
-
-    acc = float(metrics.accuracy_score(y_true, y_pred))
-    f1 = float(metrics.f1_score(y_true, y_pred, zero_division=0))
-
     return {
         "roc_auc": auc,
-        "accuracy": acc,
-        "f1": f1,
+        "accuracy": float(metrics.accuracy_score(y_true, y_pred)),
+        "f1": float(metrics.f1_score(y_true, y_pred, average="macro" if is_mc else "binary", zero_division=0)),
     }
 
 
-# Arnes de validacion cruzada de 10 pliegues (10-CV)
 def evaluate_cv(
     model_name: str,
-    model_factory: Callable,
+    model_factory: Callable[[], HistologyClassifier],
     images: np.ndarray,
     labels: np.ndarray,
     splits: list[dict],
-    return_oof: bool = True,
-) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
-
-    rows = []
-    oof_rows = []
-
-    print(f"\nIniciando evaluacion 10-CV: {model_name}")
-    print("-" * 60)
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Ejecuta validacion cruzada de 10 pliegues guardando metricas y predicciones OOF."""
+    rows, oof_rows = [], []
+    print(f"\nEvaluando 10-CV: {model_name}\n" + "-" * 55)
 
     for fold_info in splits:
         k = fold_info["fold"]
-        train_idx = np.array(fold_info["train_indices"])
-        test_idx = np.array(fold_info["test_indices"])
-
-        train_imgs, train_y = images[train_idx], labels[train_idx]
-        test_imgs, test_y = images[test_idx], labels[test_idx]
-
-        # 1. Crear modelo limpio para el pliegue k
-        model = model_factory()
-
-        # 2. Entrenar solo con datos de train
+        train_idx, test_idx = np.array(fold_info["train_indices"]), np.array(fold_info["test_indices"])
         t0 = time.perf_counter()
-        model.fit(train_imgs, train_y)
-        train_duration = time.perf_counter() - t0
+        clf = model_factory().fit(images[train_idx], labels[train_idx])
+        elapsed = time.perf_counter() - t0
 
-        # 3. Evaluar en el conjunto de test
-        y_prob = model.predict_proba(test_imgs)
-        y_pred = model.predict(test_imgs)
+        y_prob = clf.predict_proba(images[test_idx])
+        y_pred = (y_prob >= 0.5).astype(int) if y_prob.ndim == 1 else np.argmax(y_prob, axis=1).astype(int)
+        res = compute_metrics(labels[test_idx], y_prob, y_pred)
+        rows.append({"model": model_name, "fold": k, "n_train": len(train_idx), "n_test": len(test_idx), **res})
+        print(f"  Pliegue {k:2d} | AUC: {res['roc_auc']:.4f} | Acc: {res['accuracy']:.4f} | F1: {res['f1']:.4f} ({elapsed:.1f} s)")
 
-        # 4. Registrar metricas
-        fold_res = compute_metrics(test_y, y_prob, y_pred)
-        row = {
-            "model": model_name,
-            "fold": k,
-            "n_train": len(train_idx),
-            "n_test": len(test_idx),
-            **fold_res,
-        }
-        rows.append(row)
+        is_mc = y_prob.ndim == 2 and y_prob.shape[1] > 2
+        for i, orig_idx in enumerate(test_idx):
+            entry = {"model": model_name, "fold": k, "sample_idx": int(orig_idx), "y_true": int(labels[orig_idx]), "y_pred": int(y_pred[i])}
+            if is_mc:
+                entry["confidence"] = float(np.max(y_prob[i]))
+                for c in range(y_prob.shape[1]):
+                    entry[f"prob_{c}"] = float(y_prob[i, c])
+            else:
+                entry["y_prob"] = float(y_prob[i])
+            oof_rows.append(entry)
 
-        print(
-            f"  Pliegue {k:2d} | ROC-AUC: {fold_res['roc_auc']:.4f} | "
-            f"Accuracy: {fold_res['accuracy']:.4f} | F1: {fold_res['f1']:.4f} "
-            f"({train_duration:.1f} s)"
-        )
-
-        # 5. Acumular predicciones OOF
-        if return_oof:
-            for i, idx_original in enumerate(test_idx):
-                oof_rows.append({
-                    "model": model_name,
-                    "fold": k,
-                    "sample_idx": int(idx_original),
-                    "y_true": int(test_y[i]),
-                    "y_prob": float(y_prob[i]),
-                    "y_pred": int(y_pred[i]),
-                })
-
-    metrics_df = pd.DataFrame(rows)
-    if return_oof:
-        oof_df = pd.DataFrame(oof_rows)
-        return metrics_df, oof_df
-    return metrics_df
+    return pd.DataFrame(rows), pd.DataFrame(oof_rows)
 
 
-# Calcula la media y desviacion tipica entre los 10 pliegues
 def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
-    summary = results.groupby("model").agg(
-        roc_auc_mean=("roc_auc", "mean"),
-        roc_auc_std=("roc_auc", "std"),
-        acc_mean=("accuracy", "mean"),
-        acc_std=("accuracy", "std"),
-        f1_mean=("f1", "mean"),
-        f1_std=("f1", "std"),
-    )
-    return summary.round(4)
+    """Resume media y desviacion tipica por modelo sobre los 10 pliegues."""
+    return results.groupby("model", sort=False).agg(
+        roc_auc_mean=("roc_auc", "mean"), roc_auc_std=("roc_auc", "std"),
+        acc_mean=("accuracy", "mean"), acc_std=("accuracy", "std"),
+        f1_mean=("f1", "mean"), f1_std=("f1", "std"),
+    ).round(4)
 
 
-# Test de rangos con signo de Wilcoxon sobre pliegues emparejados
-# Comprueba si la diferencia entre dos modelos en los 10 pliegues es estadisticamente significativa
 def wilcoxon_compare(results: pd.DataFrame, model_a: str, model_b: str, metric: str = "roc_auc") -> dict:
+    """Test no parametrico de Wilcoxon pareado sobre los 10 pliegues."""
     a = results[results["model"] == model_a].sort_values("fold")[metric].to_numpy()
     b = results[results["model"] == model_b].sort_values("fold")[metric].to_numpy()
-    assert len(a) == len(b), "Los dos modelos deben haber sido evaluados sobre los mismos pliegues."
-
-    stat, p_value = wilcoxon(a, b)
+    _, p_value = wilcoxon(a, b)
     return {
-        "metric": metric,
-        "a": model_a,
-        "b": model_b,
-        "median_diff_a_minus_b": float(np.median(a - b)),
-        "folds_a_better": int(np.sum(a > b)),  # En ROC-AUC mayor es mejor
+        "median_diff": float(np.median(a - b)),
+        "wins": int(np.sum(a > b)),
         "p_value": float(p_value),
     }
 
 
+def holm_bonferroni_adjust(p_values: list[float]) -> list[float]:
+    """Correccion secuencial de Holm-Bonferroni para comparaciones multiples."""
+    m = len(p_values)
+    adjusted = [1.0] * m
+    prev_max = 0.0
+    for rank, (orig_idx, p_val) in enumerate(sorted(enumerate(p_values), key=lambda x: x[1])):
+        prev_max = max(prev_max, min(1.0, p_val * (m - rank)))
+        adjusted[orig_idx] = float(prev_max)
+    return adjusted
+
+
+def run_or_load_cv(
+    model_name: str,
+    model_factory: Callable[[], HistologyClassifier],
+    images: np.ndarray,
+    labels: np.ndarray,
+    splits: list[dict],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Carga resultados previos desde results/ o ejecuta la 10-CV y los guarda."""
+    cv_file = RESULTS_DIR / f"{model_name}_cv_results.csv"
+    oof_file = RESULTS_DIR / f"{model_name}_oof.csv"
+    if cv_file.exists() and oof_file.exists():
+        print(f"Cargando resultados previos de {model_name}...")
+        return pd.read_csv(cv_file), pd.read_csv(oof_file)
+
+    metrics_df, oof_df = evaluate_cv(model_name, model_factory, images, labels, splits)
+    metrics_df.to_csv(cv_file, index=False)
+    oof_df.to_csv(oof_file, index=False)
+    summarize_results(metrics_df).to_csv(RESULTS_DIR / f"{model_name}_summary.csv")
+    return metrics_df, oof_df
+
+
 # ---------------------------------------------------------------------------
-# 5. EJECUCION PRINCIPAL
+# 5. ANALISIS DE ERRORES OOF Y EXPLICABILIDAD (GRAD-CAM)
 # ---------------------------------------------------------------------------
-def main():
-    print("=" * 65)
-    print("DESAFIO DE HISTOLOGIA COLORRECTAL — NIVEL BASICO (10-CV)")
-    print(f"Dispositivo de computo: {DEVICE}")
-    print("=" * 65)
+class GradCAM:
+    """Grad-CAM mediante hooks forward (mapas) y backward (gradientes) en relu3."""
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    def __init__(self, model: nn.Module, target_layer: nn.Module):
+        self.model = model
+        self.activations: Optional[torch.Tensor] = None
+        self.gradients: Optional[torch.Tensor] = None
+        self._fwd = target_layer.register_forward_hook(lambda m, i, out: setattr(self, "activations", out.detach()))
+        self._bwd = target_layer.register_full_backward_hook(lambda m, gi, go: setattr(self, "gradients", go[0].detach()))
 
-    # 1. Cargar datos
-    images_raw, labels_bin, splits = load_dataset()
-    print(f"Dataset cargado: {len(images_raw)} imagenes (forma {images_raw.shape[1:]})")
-    print(f"Distribucion de etiquetas: NO TUMOR={np.sum(labels_bin == 0)}, TUMOR={np.sum(labels_bin == 1)}")
+    def generate(self, img_tensor: torch.Tensor, class_idx: int) -> np.ndarray:
+        """Devuelve el mapa de calor normalizado en [0, 1] reescalado a (150, 150)."""
+        self.model.eval()
+        x = img_tensor.unsqueeze(0).to(next(self.model.parameters()).device).requires_grad_(True)
+        self.model.zero_grad()
+        self.model(x)[0, class_idx].backward()
 
-    # 2. Pre-redimensionado a 32x32 para el baseline LeNet-5 (optimiza tiempo en RAM)
-    print("\nPre-redimensionando teselas a 32x32 para LeNet-5...")
-    t0 = time.perf_counter()
-    images_32 = np.stack([np.array(Image.fromarray(im).resize((32, 32), Image.BILINEAR)) for im in images_raw])
-    print(f"Redimensionado listo en {time.perf_counter() - t0:.2f} s (tamano en RAM: {images_32.nbytes / (1024*1024):.1f} MB)")
+        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
+        cam = torch.relu((weights * self.activations).sum(dim=1, keepdim=True))
+        cam = F.interpolate(cam, size=img_tensor.shape[1:], mode="bilinear", align_corners=False).squeeze().cpu().numpy()
+        return cam / float(cam.max()) if float(cam.max()) > 1e-8 else cam
 
-    # 3. Baseline LeNet-5 (Cargar si ya existe para no repetir computo, o ejecutar)
-    baseline_cv_file = RESULTS_DIR / "baseline_lenet5_cv_results.csv"
-    if baseline_cv_file.exists():
-        print("\nCargando resultados previos del Baseline LeNet-5 desde disco...")
-        baseline_metrics_df = pd.read_csv(baseline_cv_file)
-    else:
-        def create_baseline():
-            return BaselineLeNet5Classifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+    def remove_hooks(self) -> None:
+        self._fwd.remove()
+        self._bwd.remove()
 
-        baseline_metrics_df, baseline_oof_df = evaluate_cv(
-            model_name="baseline_lenet5",
-            model_factory=create_baseline,
-            images=images_32,
-            labels=labels_bin,
-            splits=splits,
-            return_oof=True,
-        )
-        baseline_metrics_df.to_csv(baseline_cv_file, index=False)
-        baseline_oof_df.to_csv(RESULTS_DIR / "baseline_lenet5_oof.csv", index=False)
-        summarize_results(baseline_metrics_df).to_csv(RESULTS_DIR / "baseline_lenet5_summary.csv")
 
-    # 4. MEJORA 1: LeNet-5 con activaciones ReLU y SGD (Cargar si ya existe)
-    relu_cv_file = RESULTS_DIR / "lenet5_relu_cv_results.csv"
-    relu_oof_file = RESULTS_DIR / "lenet5_relu_oof.csv"
-    relu_summary_file = RESULTS_DIR / "lenet5_relu_summary.csv"
+def _save_gradcam_panels(cases: list[dict], out_path: Path, include_true_cam: bool, suptitle: str) -> None:
+    """Dibuja y guarda en PNG la cuadricula de tesela original y superposiciones Grad-CAM."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    if relu_cv_file.exists() and relu_oof_file.exists():
-        print("\nCargando resultados previos de LeNet-5 ReLU (SGD) desde disco...")
-        relu_metrics_df = pd.read_csv(relu_cv_file)
-        relu_oof_df = pd.read_csv(relu_oof_file)
-    else:
-        def create_relu():
-            return LeNet5ReLUClassifier(lr=0.01, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+    ncols = 3 if include_true_cam else 2
+    fig, axes = plt.subplots(len(cases), ncols, figsize=(4.2 * ncols, 3.8 * len(cases)))
+    axes = np.expand_dims(axes, axis=0) if len(cases) == 1 else axes
 
-        relu_metrics_df, relu_oof_df = evaluate_cv(
-            model_name="lenet5_relu",
-            model_factory=create_relu,
-            images=images_32,
-            labels=labels_bin,
-            splits=splits,
-            return_oof=True,
-        )
-        relu_metrics_df.to_csv(relu_cv_file, index=False)
-        relu_oof_df.to_csv(relu_oof_file, index=False)
-        summarize_results(relu_metrics_df).to_csv(relu_summary_file)
+    for row_idx, item in enumerate(cases):
+        axes[row_idx, 0].imshow(item["image"])
+        axes[row_idx, 0].set_title(f"#{item['sample_idx']} | Real: {item['true_name']}\nPred: {item['pred_name']} ({item['confidence']:.2%})", fontsize=9)
+        axes[row_idx, 1].imshow(item["image"])
+        axes[row_idx, 1].imshow(item["cam_pred"], cmap="jet", alpha=0.45, vmin=0.0, vmax=1.0)
+        axes[row_idx, 1].set_title(f"Grad-CAM clase predicha\n({item['pred_name']})", fontsize=9)
+        if include_true_cam:
+            axes[row_idx, 2].imshow(item["image"])
+            axes[row_idx, 2].imshow(item["cam_true"], cmap="jet", alpha=0.45, vmin=0.0, vmax=1.0)
+            axes[row_idx, 2].set_title(f"Grad-CAM clase real\n({item['true_name']}, p={item['prob_true']:.2%})", fontsize=9)
+        for col_idx in range(ncols):
+            axes[row_idx, col_idx].axis("off")
 
-    # 5. EXPERIMENTO 2A: LeNet-5 ReLU con optimizador Adam (lr=0.001)
-    adam_cv_file = RESULTS_DIR / "lenet5_relu_adam_cv_results.csv"
-    adam_oof_file = RESULTS_DIR / "lenet5_relu_adam_oof.csv"
-    adam_summary_file = RESULTS_DIR / "lenet5_relu_adam_summary.csv"
+    fig.suptitle(suptitle, fontsize=10, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
 
-    if adam_cv_file.exists() and adam_oof_file.exists():
-        print("\nCargando resultados previos de LeNet-5 ReLU (Adam) desde disco...")
-        adam_metrics_df = pd.read_csv(adam_cv_file)
-        adam_oof_df = pd.read_csv(adam_oof_file)
-    else:
-        def create_adam():
-            return LeNet5ReLUAdamClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
 
-        adam_metrics_df, adam_oof_df = evaluate_cv(
-            model_name="lenet5_relu_adam",
-            model_factory=create_adam,
-            images=images_32,
-            labels=labels_bin,
-            splits=splits,
-            return_oof=True,
-        )
-        adam_metrics_df.to_csv(adam_cv_file, index=False)
-        adam_oof_df.to_csv(adam_oof_file, index=False)
-        summarize_results(adam_metrics_df).to_csv(adam_summary_file)
+def run_error_and_gradcam_analysis(images_raw: np.ndarray, labels_mc: np.ndarray, splits: list[dict], oof_df: pd.DataFrame) -> None:
+    """Resume los errores OOF globales y genera mapas Grad-CAM sobre el pliegue 3."""
+    filenames = np.load(DATA_DIR / "filenames.npy", allow_pickle=True)
+    err_df = oof_df[oof_df["y_true"] != oof_df["y_pred"]].copy()
+    err_df["true_name"] = err_df["y_true"].map(lambda i: CLASS_NAMES[int(i)])
+    err_df["pred_name"] = err_df["y_pred"].map(lambda i: CLASS_NAMES[int(i)])
+    print(f"\nANALISIS DE ERRORES OOF ({len(err_df)}/{len(oof_df)} fallos) — Top parejas:")
+    for (t_name, p_name), cnt in err_df.groupby(["true_name", "pred_name"]).size().sort_values(ascending=False).head(8).items():
+        print(f"  * {t_name} -> {p_name}: {cnt} casos")
 
-    # 6. EXPERIMENTO 2B: LeNet-5 ReLU con optimizador AdamW (lr=0.001, weight_decay=1e-4)
-    adamw_cv_file = RESULTS_DIR / "lenet5_relu_adamw_cv_results.csv"
-    adamw_oof_file = RESULTS_DIR / "lenet5_relu_adamw_oof.csv"
-    adamw_summary_file = RESULTS_DIR / "lenet5_relu_adamw_summary.csv"
+    GRADCAM_DIR.mkdir(parents=True, exist_ok=True)
+    cases_csv, err_png, ok_png = GRADCAM_DIR / "gradcam_cases.csv", GRADCAM_DIR / "gradcam_errors.png", GRADCAM_DIR / "gradcam_correct.png"
+    if cases_csv.exists() and err_png.exists() and ok_png.exists():
+        print("\nCargando casos Grad-CAM desde disco:\n" + pd.read_csv(cases_csv).to_string(index=False))
+        return
 
-    if adamw_cv_file.exists() and adamw_oof_file.exists():
-        print("\nCargando resultados previos de LeNet-5 ReLU (AdamW) desde disco...")
-        adamw_metrics_df = pd.read_csv(adamw_cv_file)
-        adamw_oof_df = pd.read_csv(adamw_oof_file)
-    else:
-        def create_adamw():
-            return LeNet5ReLUAdamWClassifier(lr=0.001, weight_decay=1e-4, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
+    target_fold, err_ids, ok_ids = 3, [2738, 1847, 4317, 352], [420, 3663]
+    clf = HistologyClassifier(lambda: ModernColorectalCNN(3, 8), num_classes=8, optimizer_name="adam", lr=0.001, scheduler_name="cosine")
+    clf.fit(images_raw[splits[target_fold]["train_indices"]], labels_mc[splits[target_fold]["train_indices"]])
 
-        adamw_metrics_df, adamw_oof_df = evaluate_cv(
-            model_name="lenet5_relu_adamw",
-            model_factory=create_adamw,
-            images=images_32,
-            labels=labels_bin,
-            splits=splits,
-            return_oof=True,
-        )
-        adamw_metrics_df.to_csv(adamw_cv_file, index=False)
-        adamw_oof_df.to_csv(adamw_oof_file, index=False)
-        summarize_results(adamw_metrics_df).to_csv(adamw_summary_file)
+    grad_cam = GradCAM(clf.model, clf.model.relu3)
+    to_tensor = transforms.ToTensor()
+    error_cases, correct_cases, rows = [], [], []
+    try:
+        for idx in err_ids + ok_ids:
+            img = images_raw[idx]
+            probs = clf.predict_proba(np.expand_dims(img, axis=0))[0]
+            true_c, pred_c = int(labels_mc[idx]), int(np.argmax(probs))
+            entry = {
+                "sample_idx": idx, "true_name": CLASS_NAMES[true_c], "pred_name": CLASS_NAMES[pred_c],
+                "confidence": float(probs[pred_c]), "prob_true": float(probs[true_c]), "image": img,
+                "cam_pred": grad_cam.generate(to_tensor(img), pred_c),
+                "cam_true": grad_cam.generate(to_tensor(img), true_c),
+            }
+            rows.append({
+                "kind": "error" if idx in err_ids else "correct", "sample_idx": idx, "fold": target_fold,
+                "true_name": entry["true_name"], "pred_name": entry["pred_name"],
+                "confidence": round(entry["confidence"], 4), "prob_true": round(entry["prob_true"], 4),
+                "filename": str(filenames[idx]),
+            })
+            (error_cases if idx in err_ids else correct_cases).append(entry)
+    finally:
+        grad_cam.remove_hooks()
 
-    # 7. EXPERIMENTO 3: CNN Moderna a 150x150 con BatchNorm, GAP y Dropout=0.2 (Balaji et al., 2022)
-    modern_cv_file = RESULTS_DIR / "modern_cnn_150_cv_results.csv"
-    modern_oof_file = RESULTS_DIR / "modern_cnn_150_oof.csv"
-    modern_summary_file = RESULTS_DIR / "modern_cnn_150_summary.csv"
+    _save_gradcam_panels(error_cases, err_png, True, "Grad-CAM (bloque conv3+BN+ReLU) sobre errores OOF del Pliegue 3 — mc_modern_cnn_150_cosine")
+    _save_gradcam_panels(correct_cases, ok_png, False, "Grad-CAM (bloque conv3+BN+ReLU) sobre aciertos del Pliegue 3\nmc_modern_cnn_150_cosine")
+    pd.DataFrame(rows).to_csv(cases_csv, index=False)
 
-    if modern_cv_file.exists() and modern_oof_file.exists():
-        print("\nCargando resultados previos de Modern CNN (150x150, Adam) desde disco...")
-        modern_metrics_df = pd.read_csv(modern_cv_file)
-        modern_oof_df = pd.read_csv(modern_oof_file)
-    else:
-        def create_modern_cnn():
-            return ModernCNNClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
 
-        # Importante: para la CNN moderna se pasa images_raw (resolucion nativa 150x150 completa)
-        modern_metrics_df, modern_oof_df = evaluate_cv(
-            model_name="modern_cnn_150",
-            model_factory=create_modern_cnn,
-            images=images_raw,
-            labels=labels_bin,
-            splits=splits,
-            return_oof=True,
-        )
-        modern_metrics_df.to_csv(modern_cv_file, index=False)
-        modern_oof_df.to_csv(modern_oof_file, index=False)
-        summarize_results(modern_metrics_df).to_csv(modern_summary_file)
+# ---------------------------------------------------------------------------
+# 6. EJECUCION PRINCIPAL (NIVEL BASICO + NIVEL MEDIO)
+# ---------------------------------------------------------------------------
+def run_basic_level(images_raw: np.ndarray, splits: list[dict]) -> None:
+    """Ejecuta o carga los 6 experimentos del Nivel Basico (binario 1:7) y sus contrastes."""
+    _, labels_bin, _ = load_dataset(multiclass=False)
+    lenet_names = ["baseline_lenet5", "lenet5_relu", "lenet5_relu_adam", "lenet5_relu_adamw"]
+    images_32 = None
+    if any(not (RESULTS_DIR / f"{name}_cv_results.csv").exists() for name in lenet_names):
+        images_32 = np.stack([np.array(Image.fromarray(im).resize((32, 32), Image.BILINEAR)) for im in images_raw])
 
-    # 8. EXPERIMENTO 4: CNN Moderna a 150x150 con Data Augmentation Biologico (Grupo D4: Flips + Rotaciones)
-    aug_cv_file = RESULTS_DIR / "modern_cnn_150_aug_cv_results.csv"
-    aug_oof_file = RESULTS_DIR / "modern_cnn_150_aug_oof.csv"
-    aug_summary_file = RESULTS_DIR / "modern_cnn_150_aug_summary.csv"
-
-    if aug_cv_file.exists() and aug_oof_file.exists():
-        print("\nCargando resultados previos de Modern CNN con Augmentation desde disco...")
-        aug_metrics_df = pd.read_csv(aug_cv_file)
-        aug_oof_df = pd.read_csv(aug_oof_file)
-    else:
-        def create_modern_cnn_aug():
-            return ModernCNNAugClassifier(lr=0.001, epochs=25, batch_size=32, seed=SEED, device=DEVICE)
-
-        aug_metrics_df, aug_oof_df = evaluate_cv(
-            model_name="modern_cnn_150_aug",
-            model_factory=create_modern_cnn_aug,
-            images=images_raw,
-            labels=labels_bin,
-            splits=splits,
-            return_oof=True,
-        )
-        aug_metrics_df.to_csv(aug_cv_file, index=False)
-        aug_oof_df.to_csv(aug_oof_file, index=False)
-        summarize_results(aug_metrics_df).to_csv(aug_summary_file)
-
-    # 9. TABLA COMPARATIVA CONSOLIDADA (10-CV)
-    all_metrics = pd.concat([baseline_metrics_df, relu_metrics_df, adam_metrics_df, adamw_metrics_df, modern_metrics_df, aug_metrics_df], ignore_index=True)
-    summary_all = summarize_results(all_metrics)
-
-    print("\n" + "=" * 65)
-    print("COMPARATIVA DE MODELOS 10-CV (Media ± Desv. Tipica):")
-    print(summary_all.to_string())
-    print("=" * 65)
-
-    # 10. CONTRASTES ESTADISTICOS DE WILCOXON (N=10 pliegues)
-    print("\n" + "=" * 65)
-    print("TEST DE RANGOS CON SIGNO DE WILCOXON (Metrica: ROC-AUC, N=10)")
-    print("=" * 65)
-
-    comparisons = [
-        ("lenet5_relu", "baseline_lenet5", "Mejora 1 (ReLU) vs. Baseline (Sigmoid)"),
-        ("lenet5_relu_adam", "lenet5_relu", "Exp 2A (Adam) vs. Mejora 1 (SGD)"),
-        ("lenet5_relu_adamw", "lenet5_relu_adam", "Exp 2B (AdamW) vs. Exp 2A (Adam)"),
-        ("modern_cnn_150", "lenet5_relu_adam", "Exp 3 (Modern CNN 150x150) vs. Exp 2A (LeNet-5 Adam 32x32)"),
-        ("modern_cnn_150", "baseline_lenet5", "Exp 3 (Modern CNN 150x150) vs. Baseline (Sigmoid 32x32)"),
-        ("modern_cnn_150_aug", "modern_cnn_150", "Exp 4 (Modern CNN + Augmentation) vs. Exp 3 (Modern CNN sin Aug)"),
-        ("modern_cnn_150_aug", "baseline_lenet5", "Exp 4 (Modern CNN + Augmentation) vs. Baseline (Sigmoid 32x32)"),
+    basic_configs = [
+        ("baseline_lenet5", images_32, lambda: HistologyClassifier(lambda: LeNet5(3, 2, "sigmoid"), 2, "sgd", lr=0.01)),
+        ("lenet5_relu", images_32, lambda: HistologyClassifier(lambda: LeNet5(3, 2, "relu"), 2, "sgd", lr=0.01)),
+        ("lenet5_relu_adam", images_32, lambda: HistologyClassifier(lambda: LeNet5(3, 2, "relu"), 2, "adam", lr=0.001)),
+        ("lenet5_relu_adamw", images_32, lambda: HistologyClassifier(lambda: LeNet5(3, 2, "relu"), 2, "adamw", lr=0.001, weight_decay=1e-4)),
+        ("modern_cnn_150", images_raw, lambda: HistologyClassifier(lambda: ModernColorectalCNN(3, 2), 2, "adam", lr=0.001)),
+        ("modern_cnn_150_aug", images_raw, lambda: HistologyClassifier(lambda: ModernColorectalCNN(3, 2), 2, "adam", lr=0.001, train_transform=get_d4_train_transform())),
     ]
 
-    for mod_a, mod_b, desc in comparisons:
-        w_res = wilcoxon_compare(all_metrics, mod_a, mod_b, metric="roc_auc")
-        sig = "ESTADISTICAMENTE SIGNIFICATIVA (p < 0.05)" if w_res['p_value'] < 0.05 else "NO significativa (p >= 0.05)"
-        print(f"\n* {desc}:")
-        print(f"  Victorias de {mod_a}: {w_res['folds_a_better']} / 10 | Dif. medianas: {w_res['median_diff_a_minus_b']:+.4f} | p-valor: {w_res['p_value']:.5f}")
-        print(f"  Veredicto: {sig}")
+    results_map = {name: run_or_load_cv(name, factory, imgs, labels_bin, splits) for name, imgs, factory in basic_configs}
+    all_metrics = pd.concat([m for m, _ in results_map.values()], ignore_index=True)
 
-    print("\n" + "=" * 65)
-    print("MATRICES DE CONFUSION GLOBALES OOF (5.000 instancias por modelo):")
-    print("=" * 65)
-    for name, df_oof in [
-        ("LeNet-5 ReLU (SGD)", relu_oof_df),
-        ("LeNet-5 ReLU (Adam)", adam_oof_df),
-        ("LeNet-5 ReLU (AdamW)", adamw_oof_df),
-        ("Modern CNN 150x150 (Adam, Dropout 0.2)", modern_oof_df),
-        ("Modern CNN 150x150 + Augmentation (D4)", aug_oof_df),
-    ]:
-        cm = metrics.confusion_matrix(df_oof["y_true"], df_oof["y_pred"])
-        print(f"\n{name}:")
-        print("                     Pred: NO TUMOR (0)    Pred: TUMOR (1)")
-        print(f"Real: NO TUMOR (0)          {cm[0, 0]:5d}               {cm[0, 1]:5d}")
-        print(f"Real: TUMOR (1)             {cm[1, 0]:5d}               {cm[1, 1]:5d}")
+    print("\n" + "=" * 65 + "\nNIVEL BASICO — COMPARATIVA BINARIA 10-CV:\n" + summarize_results(all_metrics).to_string())
+    comparisons = [
+        ("lenet5_relu", "baseline_lenet5", "Mejora 1 (ReLU) vs Baseline"),
+        ("lenet5_relu_adam", "lenet5_relu", "Exp 2A (Adam) vs Mejora 1 (SGD)"),
+        ("lenet5_relu_adamw", "lenet5_relu_adam", "Exp 2B (AdamW) vs Exp 2A (Adam)"),
+        ("modern_cnn_150", "lenet5_relu_adam", "Exp 3 (Modern CNN 150x150) vs LeNet-5 Adam"),
+        ("modern_cnn_150_aug", "modern_cnn_150", "Exp 4 (Aug D4) vs Exp 3 (Sin Aug)"),
+    ]
+    print("\nTEST DE WILCOXON BINARIO (ROC-AUC, N=10):")
+    for a, b, desc in comparisons:
+        w = wilcoxon_compare(all_metrics, a, b, "roc_auc")
+        print(f"  * {desc}: wins={w['wins']}/10 | dif_med={w['median_diff']:+.4f} | p={w['p_value']:.5f}")
+
+
+def run_medium_level(images_raw: np.ndarray, splits: list[dict]) -> None:
+    """Ejecuta o carga los 3 experimentos multiclase (8 clases), Wilcoxon+Holm y Grad-CAM."""
+    _, labels_mc, _ = load_dataset(multiclass=True)
+    clahe_tf = get_clahe_lab_transform(clip_limit=2.0, tile_grid_size=(8, 8))
+
+    mc_configs = [
+        ("mc_modern_cnn_150", lambda: HistologyClassifier(lambda: ModernColorectalCNN(3, 8), 8, "adam", lr=0.001)),
+        ("mc_modern_cnn_150_clahe", lambda: HistologyClassifier(lambda: ModernColorectalCNN(3, 8), 8, "adam", lr=0.001, train_transform=clahe_tf, eval_transform=clahe_tf)),
+        ("mc_modern_cnn_150_cosine", lambda: HistologyClassifier(lambda: ModernColorectalCNN(3, 8), 8, "adam", lr=0.001, scheduler_name="cosine", eta_min=1e-5)),
+    ]
+
+    results_map = {name: run_or_load_cv(name, factory, images_raw, labels_mc, splits) for name, factory in mc_configs}
+    mc_metrics = pd.concat([m for m, _ in results_map.values()], ignore_index=True)
+
+    print("\n" + "=" * 65 + "\nNIVEL MEDIO — COMPARATIVA MULTICLASE 8 CLASES 10-CV:\n" + summarize_results(mc_metrics).to_string())
+    mc_pairs = [
+        ("mc_modern_cnn_150_cosine", "mc_modern_cnn_150", "Exp M3 (Cosine) vs Exp M1 (lr fijo)"),
+        ("mc_modern_cnn_150_cosine", "mc_modern_cnn_150_clahe", "Exp M3 (Cosine) vs Exp M2 (Lab-CLAHE)"),
+        ("mc_modern_cnn_150_clahe", "mc_modern_cnn_150", "Exp M2 (Lab-CLAHE) vs Exp M1 (Cruda)"),
+    ]
+    print("\nTEST DE WILCOXON MULTICLASE CON AJUSTE HOLM-BONFERRONI (N=10):")
+    for metric_name in ["roc_auc", "accuracy", "f1"]:
+        raw = [wilcoxon_compare(mc_metrics, a, b, metric_name) for a, b, _ in mc_pairs]
+        adj = holm_bonferroni_adjust([r["p_value"] for r in raw])
+        print(f"  Metrica {metric_name.upper()}:")
+        for (_, _, desc), w, p_h in zip(mc_pairs, raw, adj):
+            print(f"    * {desc}: wins={w['wins']}/10 | dif_med={w['median_diff']:+.4f} | p={w['p_value']:.5f} | p_holm={p_h:.5f}")
+
+    cosine_oof = results_map["mc_modern_cnn_150_cosine"][1]
+    print("\nINFORME POR CLASE OOF — Campeon Multiclase (mc_modern_cnn_150_cosine):")
+    print(metrics.classification_report(cosine_oof["y_true"], cosine_oof["y_pred"], target_names=CLASS_NAMES, digits=4, zero_division=0))
+    run_error_and_gradcam_analysis(images_raw, labels_mc, splits, cosine_oof)
+
+
+def main() -> None:
+    print(f"DESAFIO DE HISTOLOGIA COLORRECTAL (10-CV) | Dispositivo: {DEVICE}")
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    images_raw, _, splits = load_dataset(multiclass=False)
+    run_basic_level(images_raw, splits)
+    run_medium_level(images_raw, splits)
 
 
 if __name__ == "__main__":
